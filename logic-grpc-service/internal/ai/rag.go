@@ -1,0 +1,1021 @@
+package ai
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	einoOpenAI "github.com/cloudwego/eino-ext/components/embedding/openai"
+	einoMilvus "github.com/cloudwego/eino-ext/components/retriever/milvus2"
+	einoSearchMode "github.com/cloudwego/eino-ext/components/retriever/milvus2/search_mode"
+	einoembedding "github.com/cloudwego/eino/components/embedding"
+	"github.com/cloudwego/eino/schema"
+	"github.com/milvus-io/milvus/client/v2/entity"
+	milvusindex "github.com/milvus-io/milvus/client/v2/index"
+	milvus "github.com/milvus-io/milvus/client/v2/milvusclient"
+	"golang.org/x/sync/errgroup"
+
+	"recruitment/logic-grpc-service/internal/config"
+	"recruitment/logic-grpc-service/internal/domain"
+)
+
+const (
+	resumeChunkSize    = 900
+	resumeChunkOverlap = 100
+	resumeMaxChunks    = 80
+	embeddingBatchSize = 16
+)
+
+type resumeRAGSearcher struct {
+	cfg      config.RAGConfig
+	embedder einoembedding.Embedder
+}
+
+type resumeChunkRow struct {
+	HRID           int64  `milvus:"name:hr_id"`
+	JobID          int64  `milvus:"name:job_id"`
+	ApplicationID  int64  `milvus:"name:application_id"`
+	ResumeID       int64  `milvus:"name:resume_id"`
+	CandidateID    int64  `milvus:"name:candidate_id"`
+	CandidateName  string `milvus:"name:candidate_name"`
+	ResumeFileName string `milvus:"name:resume_file_name"`
+	JobTitle       string `milvus:"name:job_title"`
+	SectionType    string `milvus:"name:section_type"`
+	SectionTitle   string `milvus:"name:section_title"`
+	ExperienceIdx  int64  `milvus:"name:experience_index"`
+	ChunkIndex     int64  `milvus:"name:chunk_index"`
+	Content        string `milvus:"name:content"`
+	SearchText     string `milvus:"name:search_text"`
+	CreatedAt      int64  `milvus:"name:created_at"`
+}
+
+type resumeExperienceChunk struct {
+	SectionType     string
+	SectionTitle    string
+	ExperienceIndex int
+	ChunkIndex      int
+	Content         string
+	SearchText      string
+}
+
+func (c *Client) ragEnabled() bool {
+	rag := c.cfg.RAG
+	return rag.Enabled && rag.EmbeddingAPIKey != "" && rag.MilvusAddress != "" && rag.MilvusCollection != ""
+}
+
+func (c *Client) IndexApplicationResume(ctx context.Context, hrID, jobID, applicationID, candidateID uint64, resume domain.Resume, profile domain.CandidateProfile, jobTitle string) error {
+	if !c.ragEnabled() {
+		return nil
+	}
+	searcher, err := newResumeRAGSearcher(ctx, c.cfg.RAG)
+	if err != nil {
+		return err
+	}
+	text := profileExperienceText(profile)
+	chunks := buildExperienceChunks(text)
+	if len(chunks) == 0 {
+		return fmt.Errorf("candidate profile has no project/work experience chunks")
+	}
+	texts := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		texts = append(texts, chunk.SearchText)
+	}
+	embeddings, err := searcher.embedDocuments(ctx, texts)
+	if err != nil {
+		return fmt.Errorf("embed resume chunks: %w", err)
+	}
+	if len(embeddings) != len(chunks) {
+		return fmt.Errorf("embedding count mismatch: got %d vectors for %d chunks", len(embeddings), len(chunks))
+	}
+	dim, err := vectorDim(embeddings)
+	if err != nil {
+		return err
+	}
+
+	milvusClient, err := searcher.newMilvusClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer milvusClient.Close(ctx)
+
+	deleteExpr := fmt.Sprintf("hr_id == %d && job_id == %d && resume_id == %d", hrID, jobID, resume.ID)
+	if _, err := milvusClient.Delete(ctx, milvus.NewDeleteOption(searcher.cfg.MilvusCollection).WithExpr(deleteExpr)); err != nil {
+		return fmt.Errorf("delete old resume chunks: %w", err)
+	}
+
+	count := len(chunks)
+	hrIDs := make([]int64, count)
+	jobIDs := make([]int64, count)
+	applicationIDs := make([]int64, count)
+	resumeIDs := make([]int64, count)
+	candidateIDs := make([]int64, count)
+	candidateNames := make([]string, count)
+	resumeFileNames := make([]string, count)
+	jobTitles := make([]string, count)
+	sectionTypes := make([]string, count)
+	sectionTitles := make([]string, count)
+	experienceIndexes := make([]int64, count)
+	chunkIndexes := make([]int64, count)
+	contents := make([]string, count)
+	searchTexts := make([]string, count)
+	createdAt := make([]int64, count)
+	now := time.Now().Unix()
+	for i, chunk := range chunks {
+		hrIDs[i] = int64(hrID)
+		jobIDs[i] = int64(jobID)
+		applicationIDs[i] = int64(applicationID)
+		resumeIDs[i] = int64(resume.ID)
+		candidateIDs[i] = int64(candidateID)
+		candidateNames[i] = strings.TrimSpace(profile.Name)
+		resumeFileNames[i] = resume.FileName
+		jobTitles[i] = strings.TrimSpace(jobTitle)
+		sectionTypes[i] = chunk.SectionType
+		sectionTitles[i] = chunk.SectionTitle
+		experienceIndexes[i] = int64(chunk.ExperienceIndex)
+		chunkIndexes[i] = int64(chunk.ChunkIndex)
+		contents[i] = chunk.Content
+		searchTexts[i] = chunk.SearchText
+		createdAt[i] = now
+	}
+	_, err = milvusClient.Insert(
+		ctx,
+		milvus.NewColumnBasedInsertOption(searcher.cfg.MilvusCollection).
+			WithInt64Column("hr_id", hrIDs).
+			WithInt64Column("job_id", jobIDs).
+			WithInt64Column("application_id", applicationIDs).
+			WithInt64Column("resume_id", resumeIDs).
+			WithInt64Column("candidate_id", candidateIDs).
+			WithVarcharColumn("candidate_name", candidateNames).
+			WithVarcharColumn("resume_file_name", resumeFileNames).
+			WithVarcharColumn("job_title", jobTitles).
+			WithVarcharColumn("section_type", sectionTypes).
+			WithVarcharColumn("section_title", sectionTitles).
+			WithInt64Column("experience_index", experienceIndexes).
+			WithInt64Column("chunk_index", chunkIndexes).
+			WithVarcharColumn("content", contents).
+			WithVarcharColumn(searcher.cfg.MilvusTextField, searchTexts).
+			WithInt64Column("created_at", createdAt).
+			WithFloatVectorColumn(searcher.cfg.MilvusVectorField, dim, embeddings),
+	)
+	if err != nil {
+		return fmt.Errorf("insert resume chunks: %w", err)
+	}
+	return nil
+}
+
+func profileExperienceText(profile domain.CandidateProfile) string {
+	var b strings.Builder
+	if strings.TrimSpace(profile.WorkExperience) != "" {
+		b.WriteString("## 工作经历\n\n")
+		b.WriteString(strings.TrimSpace(profile.WorkExperience))
+		b.WriteString("\n\n")
+	}
+	if strings.TrimSpace(profile.ProjectExperience) != "" {
+		b.WriteString("## 项目经历\n\n")
+		b.WriteString(strings.TrimSpace(profile.ProjectExperience))
+		b.WriteString("\n\n")
+	}
+	if b.Len() == 0 {
+		b.WriteString(strings.TrimSpace(profile.Experience))
+	}
+	return normalizeResumeLines(b.String())
+}
+
+func (s *resumeRAGSearcher) newMilvusClient(ctx context.Context) (*milvus.Client, error) {
+	client, err := milvus.New(ctx, &milvus.ClientConfig{
+		Address:  s.cfg.MilvusAddress,
+		Username: s.cfg.MilvusUsername,
+		Password: s.cfg.MilvusPassword,
+		DBName:   s.cfg.MilvusDBName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("connect milvus: %w", err)
+	}
+	if err := s.ensureResumeCollection(ctx, client); err != nil {
+		client.Close(ctx)
+		return nil, err
+	}
+	return client, nil
+}
+
+func (s *resumeRAGSearcher) ensureResumeCollection(ctx context.Context, client *milvus.Client) error {
+	exists, err := client.HasCollection(ctx, milvus.NewHasCollectionOption(s.cfg.MilvusCollection))
+	if err != nil {
+		return fmt.Errorf("check milvus collection: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	if err := s.createResumeCollection(ctx, client); err != nil {
+		return err
+	}
+	if err := s.createResumeCollectionIndexes(ctx, client); err != nil {
+		return err
+	}
+	loadTask, err := client.LoadCollection(ctx, milvus.NewLoadCollectionOption(s.cfg.MilvusCollection))
+	if err != nil {
+		return fmt.Errorf("load milvus collection: %w", err)
+	}
+	if err := loadTask.Await(ctx); err != nil {
+		return fmt.Errorf("await milvus collection load: %w", err)
+	}
+	return nil
+}
+
+func (s *resumeRAGSearcher) createResumeCollection(ctx context.Context, client *milvus.Client) error {
+	textField := entity.NewField().
+		WithName(s.cfg.MilvusTextField).
+		WithDataType(entity.FieldTypeVarChar).
+		WithMaxLength(8192).
+		WithEnableAnalyzer(true).
+		WithAnalyzerParams(map[string]any{"type": "chinese"})
+
+	schema := entity.NewSchema().
+		WithAutoID(true).
+		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true).WithIsAutoID(true)).
+		WithField(entity.NewField().WithName("hr_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("job_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("application_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("resume_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("candidate_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("candidate_name").WithDataType(entity.FieldTypeVarChar).WithMaxLength(128)).
+		WithField(entity.NewField().WithName("resume_file_name").WithDataType(entity.FieldTypeVarChar).WithMaxLength(255)).
+		WithField(entity.NewField().WithName("job_title").WithDataType(entity.FieldTypeVarChar).WithMaxLength(255)).
+		WithField(entity.NewField().WithName("section_type").WithDataType(entity.FieldTypeVarChar).WithMaxLength(64)).
+		WithField(entity.NewField().WithName("section_title").WithDataType(entity.FieldTypeVarChar).WithMaxLength(255)).
+		WithField(entity.NewField().WithName("experience_index").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("chunk_index").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("content").WithDataType(entity.FieldTypeVarChar).WithMaxLength(8192)).
+		WithField(textField).
+		WithField(entity.NewField().WithName(s.cfg.MilvusVectorField).WithDataType(entity.FieldTypeFloatVector).WithDim(int64(s.cfg.EmbeddingDimension))).
+		WithField(entity.NewField().WithName(s.cfg.MilvusSparseVectorField).WithDataType(entity.FieldTypeSparseVector)).
+		WithField(entity.NewField().WithName("created_at").WithDataType(entity.FieldTypeInt64)).
+		WithFunction(entity.NewFunction().
+			WithName("resume_search_text_bm25").
+			WithType(entity.FunctionTypeBM25).
+			WithInputFields(s.cfg.MilvusTextField).
+			WithOutputFields(s.cfg.MilvusSparseVectorField))
+
+	if err := client.CreateCollection(ctx, milvus.NewCreateCollectionOption(s.cfg.MilvusCollection, schema)); err != nil {
+		return fmt.Errorf("create milvus collection: %w", err)
+	}
+	return nil
+}
+
+func (s *resumeRAGSearcher) createResumeCollectionIndexes(ctx context.Context, client *milvus.Client) error {
+	metricType := entity.MetricType(strings.ToUpper(s.cfg.MilvusMetricType))
+	if metricType == "" {
+		metricType = entity.COSINE
+	}
+	denseTask, err := client.CreateIndex(
+		ctx,
+		milvus.NewCreateIndexOption(
+			s.cfg.MilvusCollection,
+			s.cfg.MilvusVectorField,
+			milvusindex.NewHNSWIndex(metricType, 16, 200),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("create dense vector index: %w", err)
+	}
+	if err := denseTask.Await(ctx); err != nil {
+		return fmt.Errorf("await dense vector index: %w", err)
+	}
+
+	sparseTask, err := client.CreateIndex(
+		ctx,
+		milvus.NewCreateIndexOption(
+			s.cfg.MilvusCollection,
+			s.cfg.MilvusSparseVectorField,
+			milvusindex.NewSparseInvertedIndex(entity.BM25, 0),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("create sparse vector index: %w", err)
+	}
+	if err := sparseTask.Await(ctx); err != nil {
+		return fmt.Errorf("await sparse vector index: %w", err)
+	}
+	return nil
+}
+
+func (s *resumeRAGSearcher) newMilvusRetriever(ctx context.Context, client *milvus.Client, topK int, mode einoMilvus.SearchMode) (*einoMilvus.Retriever, error) {
+	retriever, err := einoMilvus.NewRetriever(ctx, &einoMilvus.RetrieverConfig{
+		Client:            client,
+		Collection:        s.cfg.MilvusCollection,
+		VectorField:       s.cfg.MilvusVectorField,
+		SparseVectorField: s.cfg.MilvusSparseVectorField,
+		OutputFields:      s.cfg.MilvusOutputFields,
+		TopK:              topK,
+		SearchMode:        mode,
+		DocumentConverter: resumeDocumentConverter,
+		Embedding:         s.embedder,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create milvus retriever: %w", err)
+	}
+	return retriever, nil
+}
+
+func newResumeRAGSearcher(ctx context.Context, cfg config.RAGConfig) (*resumeRAGSearcher, error) {
+	if !cfg.Enabled {
+		return nil, fmt.Errorf("resume RAG is disabled")
+	}
+	if cfg.EmbeddingAPIKey == "" {
+		return nil, fmt.Errorf("rag embedding api key is required")
+	}
+	if cfg.MilvusAddress == "" || cfg.MilvusCollection == "" || cfg.MilvusVectorField == "" {
+		return nil, fmt.Errorf("milvus rag config is incomplete")
+	}
+	if cfg.EmbeddingEndpoint == "" {
+		cfg.EmbeddingEndpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+	}
+	if cfg.EmbeddingModel == "" {
+		cfg.EmbeddingModel = "text-embedding-v3"
+	}
+	if cfg.EmbeddingDimension <= 0 {
+		cfg.EmbeddingDimension = 1024
+	}
+	if cfg.EmbeddingTimeoutSeconds <= 0 {
+		cfg.EmbeddingTimeoutSeconds = int64((15 * time.Second).Seconds())
+	}
+	if cfg.MilvusMetricType == "" {
+		cfg.MilvusMetricType = string(entity.COSINE)
+	}
+	if cfg.MilvusSparseVectorField == "" {
+		cfg.MilvusSparseVectorField = "sparse_vector"
+	}
+	if cfg.MilvusTextField == "" {
+		cfg.MilvusTextField = "search_text"
+	}
+	if cfg.TopK <= 0 {
+		cfg.TopK = 8
+	}
+	if cfg.TopK > 20 {
+		cfg.TopK = 20
+	}
+	if len(cfg.MilvusOutputFields) == 0 {
+		cfg.MilvusOutputFields = []string{
+			"hr_id", "job_id", "application_id", "resume_id", "candidate_id",
+			"candidate_name", "resume_file_name", "job_title",
+			"section_type", "section_title", "experience_index", "chunk_index",
+			"content", cfg.MilvusTextField, "created_at",
+		}
+	}
+	embedder, err := newDashScopeOpenAIEmbedder(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &resumeRAGSearcher{cfg: cfg, embedder: embedder}, nil
+}
+
+func (s *resumeRAGSearcher) Search(ctx context.Context, hrID uint64, input ResumeSemanticSearchInput) ([]ResumeSemanticSearchItem, error) {
+	query := strings.TrimSpace(input.Query)
+	if query == "" {
+		return nil, fmt.Errorf("semantic search query is required")
+	}
+	milvusClient, err := s.newMilvusClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer milvusClient.Close(ctx)
+
+	topK := normalizeRAGLimit(input.Limit, s.cfg.TopK)
+	retriever, err := s.newMilvusRetriever(ctx, milvusClient, topK, einoSearchMode.NewHybrid(
+		milvus.NewRRFReranker(),
+		&einoSearchMode.SubRequest{
+			VectorField: s.cfg.MilvusVectorField,
+			MetricType:  einoMilvus.MetricType(strings.ToUpper(s.cfg.MilvusMetricType)),
+			TopK:        topK * 2,
+			VectorType:  einoMilvus.DenseVector,
+		},
+		&einoSearchMode.SubRequest{
+			VectorField: s.cfg.MilvusSparseVectorField,
+			MetricType:  einoMilvus.BM25,
+			TopK:        topK * 2,
+			VectorType:  einoMilvus.SparseVector,
+		},
+	))
+	if err != nil {
+		return nil, err
+	}
+	docs, err := retriever.Retrieve(ctx, query, einoMilvus.WithFilter(s.filterExpr(hrID, input)))
+	if err != nil {
+		return nil, fmt.Errorf("search milvus: %w", err)
+	}
+	if len(docs) == 0 {
+		return []ResumeSemanticSearchItem{}, nil
+	}
+
+	return documentsToSemanticItems(docs), nil
+}
+
+func (s *resumeRAGSearcher) RecommendByJD(ctx context.Context, hrID uint64, input ResumeRecommendationInput) ([]ResumeRecommendationCandidate, error) {
+	queries := recommendationQueries(input)
+	if len(queries) == 0 {
+		return nil, fmt.Errorf("recommendation query is required")
+	}
+	milvusClient, err := s.newMilvusClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer milvusClient.Close(ctx)
+
+	candidateLimit := normalizeRecommendationLimit(input.Limit)
+	evidenceLimit := normalizeEvidenceLimit(input.EvidenceLimit)
+	perQueryLimit := candidateLimit * evidenceLimit * 2
+	filter := s.recommendationFilterExpr(hrID, input)
+	denseRetriever, err := s.newMilvusRetriever(ctx, milvusClient, perQueryLimit, einoSearchMode.NewApproximate(einoMilvus.MetricType(strings.ToUpper(s.cfg.MilvusMetricType))))
+	if err != nil {
+		return nil, err
+	}
+	sparseRetriever, err := s.newMilvusRetriever(ctx, milvusClient, perQueryLimit, einoSearchMode.NewSparse(einoMilvus.BM25))
+	if err != nil {
+		return nil, err
+	}
+	var (
+		mu       sync.Mutex
+		allItems []ResumeSemanticSearchItem
+	)
+	eg, egCtx := errgroup.WithContext(ctx)
+	for _, query := range queries {
+		query := query
+		eg.Go(func() error {
+			docs, err := denseRetriever.Retrieve(egCtx, query, einoMilvus.WithFilter(filter))
+			if err != nil {
+				return fmt.Errorf("dense recommendation search milvus: %w", err)
+			}
+			items := documentsToSemanticItems(docs)
+			mu.Lock()
+			allItems = append(allItems, items...)
+			mu.Unlock()
+			return nil
+		})
+		eg.Go(func() error {
+			docs, err := sparseRetriever.Retrieve(egCtx, query, einoMilvus.WithFilter(filter))
+			if err != nil {
+				return fmt.Errorf("keyword recommendation search milvus: %w", err)
+			}
+			items := documentsToSemanticItems(docs)
+			mu.Lock()
+			allItems = append(allItems, items...)
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	merged := make(map[string]ResumeSemanticSearchItem)
+	for _, item := range allItems {
+		key := recommendationEvidenceKey(item)
+		old, ok := merged[key]
+		if !ok || item.Score > old.Score {
+			merged[key] = item
+		}
+	}
+	items := make([]ResumeSemanticSearchItem, 0, len(merged))
+	for _, item := range merged {
+		items = append(items, item)
+	}
+	return aggregateRecommendationCandidates(items, candidateLimit, evidenceLimit), nil
+}
+
+func resultSetsToSemanticItems(results []milvus.ResultSet) ([]ResumeSemanticSearchItem, error) {
+	if len(results) == 0 {
+		return nil, nil
+	}
+	items := make([]ResumeSemanticSearchItem, 0)
+	for _, result := range results {
+		part, err := resultSetToSemanticItems(result)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, part...)
+	}
+	return items, nil
+}
+
+func recommendationEvidenceKey(item ResumeSemanticSearchItem) string {
+	return fmt.Sprintf("%d:%d:%s:%d:%d", item.CandidateID, item.ResumeID, item.SectionType, item.ExperienceIndex, item.ChunkIndex)
+}
+
+func recommendationQueries(input ResumeRecommendationInput) []string {
+	seen := map[string]struct{}{}
+	queries := make([]string, 0, len(input.Queries)+1)
+	add := func(value string) {
+		value = normalizeResumeText(value)
+		if value == "" {
+			return
+		}
+		if len([]rune(value)) > 300 {
+			value = string([]rune(value)[:300])
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		queries = append(queries, value)
+	}
+	add(input.JobDescription)
+	for _, query := range input.Queries {
+		add(query)
+	}
+	if len(queries) > 5 {
+		queries = queries[:5]
+	}
+	return queries
+}
+
+func (s *resumeRAGSearcher) recommendationFilterExpr(hrID uint64, input ResumeRecommendationInput) string {
+	filters := []string{fmt.Sprintf("hr_id == %d", hrID)}
+	if input.JobID > 0 {
+		filters = append(filters, fmt.Sprintf("job_id == %d", input.JobID))
+	}
+	filters = append(filters, `section_type in ["project", "internship", "work", "experience"]`)
+	return strings.Join(filters, " && ")
+}
+
+func aggregateRecommendationCandidates(items []ResumeSemanticSearchItem, limit, evidenceLimit int) []ResumeRecommendationCandidate {
+	byCandidate := map[uint64]*ResumeRecommendationCandidate{}
+	for _, item := range items {
+		if item.CandidateID == 0 {
+			continue
+		}
+		candidate := byCandidate[item.CandidateID]
+		if candidate == nil {
+			candidate = &ResumeRecommendationCandidate{
+				CandidateID:   item.CandidateID,
+				CandidateName: item.CandidateName,
+				ResumeID:      item.ResumeID,
+				ResumeName:    item.ResumeName,
+				JobID:         item.JobID,
+				JobTitle:      item.JobTitle,
+			}
+			byCandidate[item.CandidateID] = candidate
+		}
+		candidate.Score += item.Score
+		candidate.Evidence = append(candidate.Evidence, item)
+	}
+	candidates := make([]ResumeRecommendationCandidate, 0, len(byCandidate))
+	for _, candidate := range byCandidate {
+		sort.SliceStable(candidate.Evidence, func(i, j int) bool {
+			return candidate.Evidence[i].Score > candidate.Evidence[j].Score
+		})
+		if len(candidate.Evidence) > evidenceLimit {
+			candidate.Evidence = candidate.Evidence[:evidenceLimit]
+		}
+		candidates = append(candidates, *candidate)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].Score > candidates[j].Score
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	return candidates
+}
+
+func normalizeRecommendationLimit(limit int) int {
+	if limit <= 0 {
+		return 5
+	}
+	if limit > 10 {
+		return 10
+	}
+	return limit
+}
+
+func normalizeEvidenceLimit(limit int) int {
+	if limit <= 0 {
+		return 3
+	}
+	if limit > 5 {
+		return 5
+	}
+	return limit
+}
+
+func resultSetToSemanticItems(result milvus.ResultSet) ([]ResumeSemanticSearchItem, error) {
+	if result.Err != nil {
+		return nil, result.Err
+	}
+	var rows []*resumeChunkRow
+	if err := result.Unmarshal(&rows); err != nil {
+		return nil, fmt.Errorf("unmarshal milvus result: %w", err)
+	}
+	items := make([]ResumeSemanticSearchItem, 0, len(rows))
+	for i, row := range rows {
+		score := float32(0)
+		if i < len(result.Scores) {
+			score = result.Scores[i]
+		}
+		items = append(items, ResumeSemanticSearchItem{
+			Score:           score,
+			ResumeID:        uint64(row.ResumeID),
+			JobID:           uint64(row.JobID),
+			JobTitle:        row.JobTitle,
+			CandidateID:     uint64(row.CandidateID),
+			CandidateName:   row.CandidateName,
+			SectionType:     row.SectionType,
+			SectionTitle:    row.SectionTitle,
+			ExperienceIndex: row.ExperienceIdx,
+			ChunkIndex:      row.ChunkIndex,
+			Content:         row.Content,
+			ResumeName:      row.ResumeFileName,
+		})
+	}
+	return items, nil
+}
+
+func resumeDocumentConverter(ctx context.Context, result milvus.ResultSet) ([]*schema.Document, error) {
+	_ = ctx
+	items, err := resultSetToSemanticItems(result)
+	if err != nil {
+		return nil, err
+	}
+	docs := make([]*schema.Document, 0, len(items))
+	for _, item := range items {
+		doc := (&schema.Document{
+			ID:      recommendationEvidenceKey(item),
+			Content: item.Content,
+			MetaData: map[string]any{
+				"resume_item": item,
+			},
+		}).WithScore(float64(item.Score))
+		docs = append(docs, doc)
+	}
+	return docs, nil
+}
+
+func documentsToSemanticItems(docs []*schema.Document) []ResumeSemanticSearchItem {
+	items := make([]ResumeSemanticSearchItem, 0, len(docs))
+	for _, doc := range docs {
+		if item, ok := doc.MetaData["resume_item"].(ResumeSemanticSearchItem); ok {
+			item.Score = float32(doc.Score())
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (s *resumeRAGSearcher) embedDocuments(ctx context.Context, texts []string) ([][]float32, error) {
+	out := make([][]float32, 0, len(texts))
+	for start := 0; start < len(texts); start += embeddingBatchSize {
+		end := start + embeddingBatchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+		embeddings, err := s.embedTexts(ctx, texts[start:end], "document")
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, embeddings...)
+	}
+	return out, nil
+}
+
+func (s *resumeRAGSearcher) embedTexts(ctx context.Context, texts []string, textType string) ([][]float32, error) {
+	_ = textType
+	vectors, err := s.embedder.EmbedStrings(ctx, texts, einoembedding.WithModel(s.cfg.EmbeddingModel))
+	if err != nil {
+		return nil, err
+	}
+	return float64VectorsToFloat32(vectors)
+}
+
+func newDashScopeOpenAIEmbedder(ctx context.Context, cfg config.RAGConfig) (einoembedding.Embedder, error) {
+	if cfg.EmbeddingAPIKey == "" {
+		return nil, fmt.Errorf("rag embedding api key is required")
+	}
+	if cfg.EmbeddingEndpoint == "" {
+		return nil, fmt.Errorf("rag embedding endpoint is required")
+	}
+	if cfg.EmbeddingModel == "" {
+		return nil, fmt.Errorf("rag embedding model is required")
+	}
+	embeddingConfig := &einoOpenAI.EmbeddingConfig{
+		APIKey:  cfg.EmbeddingAPIKey,
+		BaseURL: normalizeEmbeddingBaseURL(cfg.EmbeddingEndpoint),
+		Model:   cfg.EmbeddingModel,
+	}
+	if cfg.EmbeddingTimeoutSeconds > 0 {
+		embeddingConfig.Timeout = time.Duration(cfg.EmbeddingTimeoutSeconds) * time.Second
+	}
+	if cfg.EmbeddingDimension > 0 {
+		dim := cfg.EmbeddingDimension
+		embeddingConfig.Dimensions = &dim
+	}
+	return einoOpenAI.NewEmbedder(ctx, embeddingConfig)
+}
+
+func normalizeEmbeddingBaseURL(endpoint string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if endpoint == "" || strings.Contains(endpoint, "/api/v1/services/embeddings/") {
+		return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+	}
+	return endpoint
+}
+
+func (s *resumeRAGSearcher) filterExpr(hrID uint64, input ResumeSemanticSearchInput) string {
+	filters := []string{fmt.Sprintf("hr_id == %d", hrID)}
+	if input.JobID > 0 {
+		filters = append(filters, fmt.Sprintf("job_id == %d", input.JobID))
+	}
+	if input.CandidateID > 0 {
+		filters = append(filters, fmt.Sprintf("candidate_id == %d", input.CandidateID))
+	}
+	return strings.Join(filters, " && ")
+}
+
+func normalizeRAGLimit(inputLimit int, defaultLimit int) int {
+	if inputLimit <= 0 {
+		inputLimit = defaultLimit
+	}
+	if inputLimit <= 0 {
+		return 8
+	}
+	if inputLimit > 20 {
+		return 20
+	}
+	return inputLimit
+}
+
+func normalizeResumeText(value string) string {
+	var b strings.Builder
+	lastSpace := true
+	for _, r := range value {
+		if unicode.IsSpace(r) {
+			if !lastSpace {
+				b.WriteByte(' ')
+				lastSpace = true
+			}
+			continue
+		}
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		b.WriteRune(r)
+		lastSpace = false
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func normalizeResumeLines(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	lines := strings.Split(value, "\n")
+	out := make([]string, 0, len(lines))
+	blank := false
+	for _, line := range lines {
+		line = normalizeResumeText(line)
+		if line == "" {
+			if !blank && len(out) > 0 {
+				out = append(out, "")
+				blank = true
+			}
+			continue
+		}
+		out = append(out, line)
+		blank = false
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func buildExperienceChunks(text string) []resumeExperienceChunk {
+	lines := meaningfulResumeLines(text)
+	sections := detectResumeSections(lines)
+	chunks := make([]resumeExperienceChunk, 0, resumeMaxChunks)
+	for _, section := range sections {
+		sectionChunks := chunkExperienceSection(section)
+		for _, chunk := range sectionChunks {
+			chunks = append(chunks, chunk)
+			if len(chunks) >= resumeMaxChunks {
+				return chunks
+			}
+		}
+	}
+	if len(chunks) > 0 {
+		return chunks
+	}
+	fallback := fallbackExperienceText(lines)
+	if fallback == "" {
+		return nil
+	}
+	parts := splitResumeChunks(fallback)
+	for i, part := range parts {
+		content := "## 项目/实习经历\n\n" + part
+		chunks = append(chunks, resumeExperienceChunk{
+			SectionType:     "experience",
+			SectionTitle:    "项目/实习经历",
+			ExperienceIndex: 0,
+			ChunkIndex:      i,
+			Content:         content,
+			SearchText:      buildSearchText("experience", "项目/实习经历", content),
+		})
+		if len(chunks) >= resumeMaxChunks {
+			break
+		}
+	}
+	return chunks
+}
+
+type resumeSection struct {
+	Type  string
+	Title string
+	Lines []string
+	Index int
+}
+
+func meaningfulResumeLines(text string) []string {
+	raw := strings.Split(normalizeResumeLines(text), "\n")
+	lines := make([]string, 0, len(raw))
+	for _, line := range raw {
+		line = normalizeResumeText(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func detectResumeSections(lines []string) []resumeSection {
+	var sections []resumeSection
+	current := resumeSection{}
+	nextIndex := map[string]int{}
+	for _, line := range lines {
+		if sectionType, title, ok := classifyResumeHeading(line); ok {
+			if current.Type != "" && len(current.Lines) > 0 {
+				sections = append(sections, current)
+			}
+			nextIndex[sectionType]++
+			current = resumeSection{Type: sectionType, Title: title, Index: nextIndex[sectionType]}
+			continue
+		}
+		if current.Type != "" {
+			current.Lines = append(current.Lines, line)
+		}
+	}
+	if current.Type != "" && len(current.Lines) > 0 {
+		sections = append(sections, current)
+	}
+	return sections
+}
+
+func classifyResumeHeading(line string) (string, string, bool) {
+	normalized := strings.ToLower(strings.Trim(line, "#:：|- "))
+	compact := strings.ReplaceAll(normalized, " ", "")
+	if len([]rune(compact)) > 24 {
+		return "", "", false
+	}
+	switch {
+	case containsAny(compact, []string{"项目经历", "项目经验", "项目实践", "项目介绍"}):
+		return "project", "项目经历", true
+	case containsAny(compact, []string{"实习经历", "实习经验"}):
+		return "internship", "实习经历", true
+	case containsAny(compact, []string{"工作经历", "工作经验", "任职经历"}):
+		return "work", "工作经历", true
+	}
+	return "", "", false
+}
+
+func chunkExperienceSection(section resumeSection) []resumeExperienceChunk {
+	body := strings.Join(section.Lines, "\n")
+	if body == "" {
+		return nil
+	}
+	title := section.Title
+	if len(section.Lines) > 0 && looksLikeExperienceTitle(section.Lines[0]) {
+		title = section.Lines[0]
+	}
+	parts := splitResumeChunks(body)
+	chunks := make([]resumeExperienceChunk, 0, len(parts))
+	for i, part := range parts {
+		content := fmt.Sprintf("## %s：%s\n\n%s", markdownSectionName(section.Type), title, part)
+		chunks = append(chunks, resumeExperienceChunk{
+			SectionType:     section.Type,
+			SectionTitle:    title,
+			ExperienceIndex: section.Index,
+			ChunkIndex:      i,
+			Content:         content,
+			SearchText:      buildSearchText(section.Type, title, content),
+		})
+	}
+	return chunks
+}
+
+func markdownSectionName(sectionType string) string {
+	switch sectionType {
+	case "project":
+		return "项目经历"
+	case "internship":
+		return "实习经历"
+	case "work":
+		return "工作经历"
+	default:
+		return "经历证据"
+	}
+}
+
+func looksLikeExperienceTitle(line string) bool {
+	if len([]rune(line)) > 80 {
+		return false
+	}
+	return containsAny(line, []string{"项目", "系统", "平台", "公司", "实习", "工作", "开发", "工程师"})
+}
+
+func buildSearchText(sectionType, title, content string) string {
+	return normalizeResumeText(strings.Join([]string{sectionType, title, content}, " "))
+}
+
+func fallbackExperienceText(lines []string) string {
+	selected := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if containsAny(line, []string{"项目", "系统", "平台", "实习", "工作", "负责", "开发", "实现", "优化", "技术栈", "后端", "前端", "数据库", "微服务", "高并发"}) {
+			selected = append(selected, line)
+		}
+	}
+	if len(selected) < 2 {
+		return ""
+	}
+	return strings.Join(selected, "\n")
+}
+
+func containsAny(value string, keywords []string) bool {
+	value = strings.ToLower(value)
+	for _, keyword := range keywords {
+		if strings.Contains(value, strings.ToLower(keyword)) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitResumeChunks(text string) []string {
+	runes := []rune(normalizeResumeText(text))
+	if len(runes) == 0 {
+		return nil
+	}
+	chunks := make([]string, 0, minInt(resumeMaxChunks, len(runes)/resumeChunkSize+1))
+	for start := 0; start < len(runes) && len(chunks) < resumeMaxChunks; {
+		end := start + resumeChunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunk := strings.TrimSpace(string(runes[start:end]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		if end == len(runes) {
+			break
+		}
+		next := end - resumeChunkOverlap
+		if next <= start {
+			next = end
+		}
+		start = next
+	}
+	return chunks
+}
+
+func vectorDim(vectors [][]float32) (int, error) {
+	if len(vectors) == 0 || len(vectors[0]) == 0 {
+		return 0, fmt.Errorf("empty embedding vectors")
+	}
+	dim := len(vectors[0])
+	for i, vector := range vectors {
+		if len(vector) != dim {
+			return 0, fmt.Errorf("embedding vector %d dimension mismatch: got %d want %d", i, len(vector), dim)
+		}
+	}
+	return dim, nil
+}
+
+func float64VectorsToFloat32(vectors [][]float64) ([][]float32, error) {
+	if len(vectors) == 0 {
+		return nil, fmt.Errorf("empty embedding vectors")
+	}
+	out := make([][]float32, 0, len(vectors))
+	for i, vector := range vectors {
+		if len(vector) == 0 {
+			return nil, fmt.Errorf("embedding vector %d is empty", i)
+		}
+		converted := make([]float32, len(vector))
+		for j, value := range vector {
+			converted[j] = float32(value)
+		}
+		out = append(out, converted)
+	}
+	return out, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

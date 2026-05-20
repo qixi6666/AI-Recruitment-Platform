@@ -1,0 +1,310 @@
+# AI Recruitment Platform
+
+一个面向招聘业务的全栈系统，覆盖候选人投递、HR 岗位管理、简历附件上传、投递台账和 AI 招聘数据问答。系统采用前后端分离架构，HTTP 网关与核心业务服务之间通过 gRPC 通信，核心数据存储在 MySQL，AI 模块基于 Eino Agent 封装受控的招聘数据查询工具，并可通过 Milvus + 阿里 DashScope Embedding 对候选人自填项目/工作经历做语义检索。
+
+## 项目亮点
+
+- **前后端分离**：Vue 3 + Vite 构建前端工作台，Gin 提供 HTTP API，Vite proxy 解决本地跨域。
+- **微服务分层**：Web 网关层负责 JWT、CORS、参数绑定和 HTTP/gRPC 转换；Logic 服务承载核心业务规则。
+- **权限与资源隔离**：候选人、HR 分角色访问；HR 只能管理自己的岗位和查看自己岗位下的投递数据。
+- **简历附件上传**：Gin 接收 multipart 文件，校验后缀和文件头魔数，MySQL 只保存文件路径和元数据；附件用于 HR 下载查看，不参与经历抽取。
+- **AI 招聘数据问答**：HR 可用自然语言查询岗位热度、投递统计、候选人筛选等数据；LLM 只能调用后端注册的 Tool，不能直接执行任意 SQL。
+- **RAG 候选人推荐**：将候选人自填的项目经历和工作经历转成 Markdown 证据片段，写入 Milvus dense + BM25 sparse hybrid collection，Agent 可按 JD 推荐候选人。
+- **gRPC 可观测与稳定性**：Logic 服务提供健康检查、请求日志拦截器和优雅退出；MySQL 连接池支持环境变量配置。
+- **数据库查询优化**：针对岗位列表、投递台账、聊天历史等访问路径设计复合索引，并减少列表场景 N+1 查询。
+
+## 智能候选人匹配
+
+系统围绕 HR “根据岗位 JD 推荐候选人”的场景实现了一套证据驱动的 RAG 匹配流程。候选人先在档案中填写基本信息、工作经历和项目经历，并上传简历作为附件。投递成功后，Logic 服务会读取候选人自填经历，而不是解析简历文件，将经历归一化成 Markdown 证据片段，例如：
+
+```md
+## 项目经历：AI 招聘系统
+
+技术栈：Go、Gin、gRPC、MySQL、Vue、Eino、Milvus
+
+负责内容：
+- 设计 HR AI 对话 Agent
+- 实现候选人经历 RAG 检索与推荐
+- 基于 Milvus 存储项目/工作经历向量证据
+```
+
+每个证据片段会同时写入两类检索字段：
+
+- `dense_vector`：调用阿里 DashScope Embedding 生成语义向量，用于召回“表达不同但语义接近”的经历。
+- `search_text` / `sparse_vector`：通过 Milvus BM25 Function 生成稀疏向量，用于关键词召回，例如 Go、gRPC、RAG、支付系统、高并发等明确技能或业务词。
+
+HR 在 AI 对话中要求按 JD 推荐候选人时，Eino Agent 会调用 `recommend_resumes_by_jd` 工具。工具名沿用早期命名以兼容已有 Agent 配置，但当前检索内容来自候选人自填经历。工具会根据岗位 JD 和模型生成的多路 query 发起检索，并使用 Go `errgroup` 并发执行 dense 向量检索和 BM25 关键词检索。所有检索完成后，后端通过 `map` 按 `candidate_id + resume_id + section_type + experience_index + chunk_index` 合并去重，再按 `candidate_id` 聚合为候选人维度的证据集。
+
+最终返回给大模型的不是整份简历附件，而是候选人的自填项目/工作经历证据片段。大模型基于这些证据输出匹配度评分、推荐理由和潜在风险点，避免凭空判断候选人能力。整体链路为：
+
+```text
+候选人填写基本信息、工作经历、项目经历并上传简历附件
+    -> 投递岗位
+    -> 自填项目/工作经历 Markdown 结构化
+    -> DashScope Embedding + Milvus BM25 入库
+    -> HR 输入 JD 推荐需求
+    -> errgroup 并发 dense/sparse 多路召回
+    -> map 去重并按 candidate_id 聚合
+    -> Eino Agent 基于证据生成推荐结果
+```
+
+## 功能模块
+
+### 候选人端
+
+- 注册、登录
+- 浏览公开岗位、按关键词搜索
+- 完善基本信息、工作经历和项目经历
+- 上传简历附件
+- 投递岗位
+- 查看个人投递记录
+
+### HR 端
+
+- 注册、登录
+- 新增、编辑、下架岗位
+- 查看自己发布的岗位列表
+- 查看投递台账和候选人结构化档案
+- 下载候选人简历
+- 使用 AI 对话查询招聘数据
+- 查看 AI 历史对话
+
+## 技术栈
+
+| 模块 | 技术 |
+| --- | --- |
+| Frontend | Vue 3, TypeScript, Pinia, Vite, lucide-vue-next |
+| HTTP Gateway | Go, Gin, JWT, CORS |
+| Logic Service | Go, gRPC, GORM |
+| Database | MySQL / InnoDB |
+| AI Agent | CloudWeGo Eino, DeepSeek OpenAI-compatible API, Tool Calling |
+| RAG | Milvus, 阿里 DashScope text embedding |
+| File Storage | Gin 本地附件上传，MySQL 保存简历元数据 |
+
+## 系统架构
+
+```text
+Vue Frontend
+    |
+    | HTTP / SSE
+    v
+Gin Web Gateway
+    |
+    | gRPC
+    v
+Logic gRPC Service
+    |
+    +--> MySQL
+    +--> Local Resume Files
+    +--> Milvus Experience Vectors
+    +--> Eino Agent + Recruitment Tools
+```
+
+核心服务说明：
+
+- `recruitment-frontend`：Vue 前端，提供公开岗位、候选人工作台、HR 工作台和 AI 对话页面。
+- `web-gin-service`：HTTP 网关，负责登录注册、JWT 校验、角色中间件、REST API 和 SSE 输出。
+- `logic-grpc-service`：业务核心服务，负责账号、岗位、候选人档案、简历附件、投递、AI 对话和数据库访问。
+- `shared`：Web 与 Logic 共享的 gRPC 服务描述、DTO 和 JSON Codec。
+
+## 目录结构
+
+```text
+.
+├── recruitment-frontend/      # Vue 3 前端
+├── web-gin-service/           # Gin HTTP 网关
+├── logic-grpc-service/        # gRPC 业务服务
+├── shared/                    # 共享 RPC 契约
+├── api.md                     # HTTP API 文档
+├── db.md                      # 数据库设计文档
+├── go.work                    # Go workspace
+└── .env.example               # 环境变量示例
+```
+
+## 快速启动
+
+### 1. 准备 MySQL
+
+```sql
+CREATE DATABASE recruitment DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+### 2. 准备环境变量
+
+```bash
+cp .env.example .env
+```
+
+需要配置的关键变量：
+
+```bash
+MYSQL_DSN="user:password@tcp(127.0.0.1:3306)/recruitment?charset=utf8mb4&parseTime=True&loc=Local"
+JWT_SECRET="your-jwt-secret"
+
+DEEPSEEK_API_KEY=""
+DEEPSEEK_BASE_URL="https://api.deepseek.com"
+DEEPSEEK_MODEL="deepseek-chat"
+UPLOAD_DIR="uploads"
+```
+
+可选 RAG 配置：
+
+```bash
+RAG_ENABLED=true
+DASHSCOPE_API_KEY=""
+RAG_EMBEDDING_ENDPOINT="https://dashscope.aliyuncs.com/compatible-mode/v1"
+RAG_EMBEDDING_MODEL="text-embedding-v3"
+RAG_EMBEDDING_DIMENSION=1024
+MILVUS_ADDRESS="127.0.0.1:19530"
+MILVUS_COLLECTION="resume_experience_chunks"
+MILVUS_VECTOR_FIELD="dense_vector"
+MILVUS_SPARSE_VECTOR_FIELD="sparse_vector"
+MILVUS_TEXT_FIELD="search_text"
+MILVUS_OUTPUT_FIELDS="hr_id,job_id,application_id,resume_id,candidate_id,candidate_name,resume_file_name,job_title,section_type,section_title,experience_index,chunk_index,content,search_text,created_at"
+RAG_TOP_K=8
+```
+
+RAG 入库在候选人投递成功后触发：Logic 服务会读取候选人档案中的 `work_experience` 和 `project_experience`，转成 Markdown 证据片段，调用阿里 DashScope Embedding 生成 `dense_vector`，同时依赖 Milvus BM25 Function 从 `search_text` 生成 `sparse_vector`。上传的 PDF/DOC/DOCX 简历文件不参与经历抽取，仅作为 HR 下载附件。`resume_id` 和 `resume_file_name` 字段仍保留，用于把检索证据关联回投递时的简历附件。
+
+Milvus collection 需要提前创建，建议使用 autoID 主键，并包含以下字段：
+
+```text
+id                int64 primary key auto_id
+hr_id             int64
+job_id            int64
+application_id    int64
+resume_id         int64
+candidate_id      int64
+candidate_name    varchar
+resume_file_name  varchar
+job_title         varchar
+section_type      varchar
+section_title     varchar
+experience_index  int64
+chunk_index       int64
+content           varchar
+search_text       varchar analyzer enabled
+dense_vector      float_vector
+sparse_vector     sparse_float_vector generated by BM25(search_text)
+created_at        int64
+```
+
+可选连接池配置：
+
+```bash
+MYSQL_MAX_OPEN_CONNS=25
+MYSQL_MAX_IDLE_CONNS=10
+MYSQL_CONN_MAX_LIFETIME_SECONDS=1800
+```
+
+### 3. 启动后端
+
+在项目根目录同步 Go workspace：
+
+```bash
+go work sync
+```
+
+启动 Logic gRPC 服务：
+
+```bash
+cd logic-grpc-service
+go run ./cmd/server
+```
+
+启动 Gin Web 网关：
+
+```bash
+cd web-gin-service
+go run ./cmd/server
+```
+
+默认服务地址：
+
+- Gin Web API：`http://127.0.0.1:8080`
+- Logic gRPC：`127.0.0.1:9002`
+
+### 4. 启动前端
+
+```bash
+cd recruitment-frontend
+npm install
+npm run dev
+```
+
+前端默认访问地址：
+
+```text
+http://localhost:5173/
+```
+
+Vite 已配置代理，前端请求 `/api` 会转发到 `http://127.0.0.1:8080`。
+
+## API 文档
+
+HTTP 接口见 [api.md](./api.md)，主要前缀为：
+
+```text
+/api/v1
+```
+
+统一响应：
+
+```json
+{ "data": {} }
+```
+
+统一错误：
+
+```json
+{ "error": "错误说明" }
+```
+
+## 数据库设计
+
+数据库表结构和索引设计见 [db.md](./db.md)。主要实体包括：
+
+- `users`
+- `jobs`
+- `candidate_profiles`
+- `resumes`
+- `applications`
+- `chat_messages`
+
+## AI 对话设计
+
+AI 模块使用 Eino 构建招聘场景 Agent。HR 输入自然语言问题后，Logic 服务会注入当前 HR 的最近对话历史，并注册当前 HR 作用域内的招聘数据工具：
+
+- `get_overall_recruitment_stats`：招聘概览统计
+- `get_job_hotness_rank`：岗位热度排行
+- `get_job_application_stats`：岗位投递统计
+- `search_candidates`：按技能、学历、学校、城市和岗位关键词筛选候选人
+- `semantic_search_resumes`：基于 Milvus hybrid search 检索当前 HR 岗位收到的候选人自填项目/工作经历证据片段；工具名沿用早期命名
+- `recommend_resumes_by_jd`：根据岗位 JD 多路召回经历证据，按候选人聚合后交给 Agent 判断匹配度、评分和推荐理由；工具名沿用早期命名
+
+Tool 函数由后端封装固定查询逻辑，闭包绑定当前 HR 身份，避免模型越权查询其他 HR 数据。流式对话链路为：
+
+```text
+Frontend fetch stream
+    -> Gin SSE endpoint
+    -> gRPC server streaming
+    -> Eino Agent
+    -> MySQL Tools
+```
+
+## 本地验证
+
+后端：
+
+```bash
+cd logic-grpc-service && go test ./...
+cd web-gin-service && go test ./...
+cd shared && go test ./...
+```
+
+前端：
+
+```bash
+cd recruitment-frontend
+npm run build
+```

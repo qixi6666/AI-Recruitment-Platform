@@ -1,0 +1,8 @@
+**/config.json
+.env
+**/.env
+**/node_modules/
+**/dist/
+uploads/
+DEVELOPMENT_PROGRESS.md
+
