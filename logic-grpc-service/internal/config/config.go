@@ -24,12 +24,15 @@ type MySQLConfig struct {
 }
 
 type AIConfig struct {
-	Provider       string
-	APIKey         string
-	BaseURL        string
-	Model          string
-	TimeoutSeconds int64
-	RAG            RAGConfig
+	Provider            string
+	APIKey              string
+	BaseURL             string
+	Model               string
+	TimeoutSeconds      int64
+	MemoryRounds        int
+	MemoryTriggerTokens int
+	ShowToolResults     bool
+	RAG                 RAGConfig
 }
 
 type RAGConfig struct {
@@ -64,10 +67,12 @@ func Load() (Config, error) {
 			ConnMaxLifetimeSeconds: int64((30 * time.Minute).Seconds()),
 		},
 		AI: AIConfig{
-			Provider:       "deepseek",
-			BaseURL:        "https://api.deepseek.com",
-			Model:          "deepseek-chat",
-			TimeoutSeconds: int64((45 * time.Second).Seconds()),
+			Provider:            "deepseek",
+			BaseURL:             "https://api.deepseek.com",
+			Model:               "deepseek-chat",
+			TimeoutSeconds:      int64((45 * time.Second).Seconds()),
+			MemoryRounds:        5,
+			MemoryTriggerTokens: 6000,
 			RAG: RAGConfig{
 				EmbeddingEndpoint:       "https://dashscope.aliyuncs.com/compatible-mode/v1",
 				EmbeddingModel:          "text-embedding-v3",
@@ -102,6 +107,9 @@ func Load() (Config, error) {
 	overrideString(&cfg.AI.BaseURL, "DEEPSEEK_BASE_URL")
 	overrideString(&cfg.AI.Model, "DEEPSEEK_MODEL")
 	overrideInt64(&cfg.AI.TimeoutSeconds, "DEEPSEEK_TIMEOUT_SECONDS")
+	overrideInt(&cfg.AI.MemoryRounds, "AI_MEMORY_ROUNDS")
+	overrideInt(&cfg.AI.MemoryTriggerTokens, "AI_MEMORY_TRIGGER_TOKENS")
+	overrideBool(&cfg.AI.ShowToolResults, "AI_SHOW_TOOL_RESULTS")
 	overrideBool(&cfg.AI.RAG.Enabled, "RAG_ENABLED")
 	overrideString(&cfg.AI.RAG.EmbeddingAPIKey, "DASHSCOPE_API_KEY")
 	overrideString(&cfg.AI.RAG.EmbeddingAPIKey, "RAG_EMBEDDING_API_KEY")

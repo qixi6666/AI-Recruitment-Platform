@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
@@ -26,10 +27,56 @@ type Client struct {
 type AgentAnswer struct {
 	Answer    string
 	UsedTools []string
+	ToolCalls []ToolCallRecord
+}
+
+type ToolCallRecord struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+	Result    string `json:"result"`
+	Error     string `json:"error,omitempty"`
 }
 
 func NewClient(cfg config.AIConfig, db *gorm.DB) *Client {
 	return &Client{cfg: cfg, db: db}
+}
+
+func (c *Client) SummarizeMemory(ctx context.Context, oldSummary string, pendingHistory string) (string, error) {
+	if c.cfg.APIKey == "" {
+		return "", fmt.Errorf("ai api key is required for memory summarization")
+	}
+	pendingHistory = strings.TrimSpace(pendingHistory)
+	if pendingHistory == "" {
+		return strings.TrimSpace(oldSummary), nil
+	}
+	timeout := time.Duration(c.cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 45 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cm, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+		APIKey:  c.cfg.APIKey,
+		Model:   c.cfg.Model,
+		BaseURL: c.cfg.BaseURL,
+		Timeout: timeout,
+	})
+	if err != nil {
+		return "", err
+	}
+	msg, err := cm.Generate(ctx, []*schema.Message{
+		schema.SystemMessage(memorySummaryInstruction()),
+		schema.UserMessage(fmt.Sprintf("已有摘要：\n%s\n\n待压缩历史：\n%s", strings.TrimSpace(oldSummary), pendingHistory)),
+	})
+	if err != nil {
+		return "", err
+	}
+	summary := strings.TrimSpace(msg.Content)
+	if summary == "" {
+		return "", fmt.Errorf("memory summarizer returned empty summary")
+	}
+	return summary, nil
 }
 
 func (c *Client) AnswerWithTools(ctx context.Context, hrID uint64, question string, history []*schema.Message) (AgentAnswer, error) {
@@ -122,7 +169,7 @@ func (c *Client) StreamWithTools(ctx context.Context, hrID uint64, question stri
 			}
 		}
 	}
-	return AgentAnswer{UsedTools: tracker.names()}, nil
+	return AgentAnswer{UsedTools: tracker.names(), ToolCalls: tracker.recordsSnapshot()}, nil
 }
 
 func consumeAssistantStream(stream adk.MessageStream, onChunk func(string) error) error {
@@ -155,33 +202,63 @@ func buildInstruction() string {
 	b.WriteString("涉及统计或筛选时必须先调用最合适的工具；不要编造候选人、岗位、投递数量、简历附件或经历数据。\n")
 	b.WriteString("当问题涉及候选人填写的项目经历、工作经历、业务背景、技术细节等非结构化内容时，优先调用 semantic_search_resumes 工具。\n")
 	b.WriteString("当 HR 要求推荐候选人或按岗位 JD 匹配简历时，调用 recommend_resumes_by_jd；你需要基于工具返回的候选人自填项目/工作证据判断匹配度、给出评分、推荐理由和风险点，不要编造证据。\n")
+	b.WriteString("历史工具调用记录只用于理解上下文；涉及当前统计、筛选和推荐时仍以本轮工具返回结果为准。\n")
 	b.WriteString("工具已经按当前 HR 账号做了数据隔离，你不能要求或推断其他 HR 的数据。\n")
 	b.WriteString("最终回答使用中文，简洁、结构化，明确说明查询口径来自当前 HR 创建的岗位。\n")
 	return b.String()
 }
 
+func memorySummaryInstruction() string {
+	var b strings.Builder
+	b.WriteString("你是招聘系统 Agent 的长期记忆压缩器。\n")
+	b.WriteString("请把待压缩历史合并进已有摘要，输出新的滚动摘要。\n")
+	b.WriteString("只保留用户长期目标、偏好、已确认的系统设计、稳定背景和未完成事项。\n")
+	b.WriteString("不要保留工具调用的详细参数、原始 JSON、候选人列表、岗位数量、投递数量、评分等可能过期的数据。\n")
+	b.WriteString("工具相关最多概括为用户讨论过某类查询或推荐能力；涉及实时招聘数据时必须说明后续需要重新调用工具查询。\n")
+	b.WriteString("摘要使用中文，结构化、简洁，控制在 800 字以内。\n")
+	return b.String()
+}
+
 type toolCallTracker struct {
 	*adk.BaseChatModelAgentMiddleware
-	calls []string
+	mu      sync.Mutex
+	records []ToolCallRecord
 }
 
 func (t *toolCallTracker) WrapInvokableToolCall(ctx context.Context, endpoint adk.InvokableToolCallEndpoint, toolCtx *adk.ToolContext) (adk.InvokableToolCallEndpoint, error) {
 	return func(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
-		t.calls = append(t.calls, toolCtx.Name)
-		return endpoint(ctx, argumentsInJSON, opts...)
+		result, err := endpoint(ctx, argumentsInJSON, opts...)
+		record := ToolCallRecord{Name: toolCtx.Name, Arguments: argumentsInJSON, Result: result}
+		if err != nil {
+			record.Error = err.Error()
+		}
+		t.mu.Lock()
+		t.records = append(t.records, record)
+		t.mu.Unlock()
+		return result, err
 	}, nil
 }
 
 func (t *toolCallTracker) names() []string {
-	out := make([]string, 0, len(t.calls))
+	records := t.recordsSnapshot()
+	out := make([]string, 0, len(records))
 	seen := map[string]struct{}{}
-	for _, name := range t.calls {
+	for _, record := range records {
+		name := record.Name
 		if _, ok := seen[name]; ok {
 			continue
 		}
 		seen[name] = struct{}{}
 		out = append(out, name)
 	}
+	return out
+}
+
+func (t *toolCallTracker) recordsSnapshot() []ToolCallRecord {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]ToolCallRecord, len(t.records))
+	copy(out, t.records)
 	return out
 }
 

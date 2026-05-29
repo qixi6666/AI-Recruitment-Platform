@@ -41,6 +41,7 @@ func Open(cfg Config) (*gorm.DB, error) {
 		&domain.Resume{},
 		&domain.Application{},
 		&domain.ChatMessage{},
+		&domain.ChatMemorySummary{},
 	); err != nil {
 		return nil, err
 	}

@@ -208,7 +208,9 @@ type ListApplicationsResponse struct {
 type ChatMessageDTO struct {
 	ID        uint64 `json:"id"`
 	HRID      uint64 `json:"hr_id"`
+	TurnID    string `json:"turn_id,omitempty"`
 	Role      string `json:"role"`
+	ToolName  string `json:"tool_name,omitempty"`
 	Content   string `json:"content"`
 	CreatedAt string `json:"created_at"`
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -23,12 +24,46 @@ import (
 )
 
 type Server struct {
-	db *gorm.DB
-	ai *ai.Client
+	db                  *gorm.DB
+	ai                  *ai.Client
+	memoryRounds        int
+	memoryTriggerTokens int
+	showToolResults     bool
 }
 
-func NewServer(db *gorm.DB, aiClient *ai.Client) *Server {
-	return &Server{db: db, ai: aiClient}
+type Option func(*Server)
+
+func WithMemoryRounds(rounds int) Option {
+	return func(s *Server) {
+		if rounds > 0 {
+			if rounds > 20 {
+				rounds = 20
+			}
+			s.memoryRounds = rounds
+		}
+	}
+}
+
+func WithShowToolResults(show bool) Option {
+	return func(s *Server) {
+		s.showToolResults = show
+	}
+}
+
+func WithMemoryTriggerTokens(tokens int) Option {
+	return func(s *Server) {
+		if tokens > 0 {
+			s.memoryTriggerTokens = tokens
+		}
+	}
+}
+
+func NewServer(db *gorm.DB, aiClient *ai.Client, opts ...Option) *Server {
+	s := &Server{db: db, ai: aiClient, memoryRounds: 5, memoryTriggerTokens: 6000}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *Server) Register(ctx context.Context, req *rpc.RegisterRequest) (*rpc.RegisterResponse, error) {
@@ -350,7 +385,7 @@ func (s *Server) AIChat(ctx context.Context, req *rpc.AIChatRequest) (*rpc.AICha
 	if question == "" {
 		return nil, status.Error(codes.InvalidArgument, "question is required")
 	}
-	history, err := s.recentHistoryMessages(ctx, req.Actor.UserID, 6)
+	history, err := s.memoryContextMessages(ctx, req.Actor.UserID, question)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -359,10 +394,7 @@ func (s *Server) AIChat(ctx context.Context, req *rpc.AIChatRequest) (*rpc.AICha
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	now := time.Now()
-	records := []domain.ChatMessage{
-		{HRID: req.Actor.UserID, Role: domain.ChatRoleUser, Content: question, CreatedAt: now},
-		{HRID: req.Actor.UserID, Role: domain.ChatRoleAssistant, Content: answer.Answer, CreatedAt: now.Add(time.Millisecond)},
-	}
+	records := chatTurnRecords(req.Actor.UserID, chatTurnID(now), question, answer.Answer, answer.ToolCalls, now)
 	if err := s.db.WithContext(ctx).Create(&records).Error; err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -384,7 +416,7 @@ func (s *Server) AIChatStream(req *rpc.AIChatRequest, stream rpc.LogicService_AI
 		return status.Error(codes.InvalidArgument, "question is required")
 	}
 	ctx := stream.Context()
-	history, err := s.recentHistoryMessages(ctx, req.Actor.UserID, 6)
+	history, err := s.memoryContextMessages(ctx, req.Actor.UserID, question)
 	if err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
@@ -401,10 +433,7 @@ func (s *Server) AIChatStream(req *rpc.AIChatRequest, stream rpc.LogicService_AI
 		return status.Error(codes.Internal, "agent returned empty answer")
 	}
 	now := time.Now()
-	records := []domain.ChatMessage{
-		{HRID: req.Actor.UserID, Role: domain.ChatRoleUser, Content: question, CreatedAt: now},
-		{HRID: req.Actor.UserID, Role: domain.ChatRoleAssistant, Content: finalAnswer, CreatedAt: now.Add(time.Millisecond)},
-	}
+	records := chatTurnRecords(req.Actor.UserID, chatTurnID(now), question, finalAnswer, answer.ToolCalls, now)
 	if err := s.db.WithContext(ctx).Create(&records).Error; err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
@@ -425,37 +454,311 @@ func (s *Server) ListChatHistory(ctx context.Context, req *rpc.ListChatHistoryRe
 	if limit <= 0 || limit > 200 {
 		limit = 100
 	}
+	q := s.db.WithContext(ctx).Where("hr_id = ? AND role <> ?", req.Actor.UserID, domain.ChatRoleTool)
 	var rows []domain.ChatMessage
-	if err := s.db.WithContext(ctx).Where("hr_id = ?", req.Actor.UserID).
-		Order("created_at DESC").Limit(limit).Find(&rows).Error; err != nil {
+	if err := q.Order("created_at DESC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].CreatedAt.Before(rows[j].CreatedAt) })
 	items := make([]*rpc.ChatMessageDTO, 0, len(rows))
 	for _, row := range rows {
 		items = append(items, &rpc.ChatMessageDTO{
-			ID: row.ID, HRID: row.HRID, Role: row.Role, Content: row.Content, CreatedAt: rpc.FormatTime(row.CreatedAt),
+			ID: row.ID, HRID: row.HRID, TurnID: row.TurnID, Role: row.Role, ToolName: row.ToolName, Content: row.Content, CreatedAt: rpc.FormatTime(row.CreatedAt),
 		})
 	}
 	return &rpc.ListChatHistoryResponse{Items: items}, nil
 }
 
-func (s *Server) recentHistoryMessages(ctx context.Context, hrID uint64, limit int) ([]*schema.Message, error) {
-	var rows []domain.ChatMessage
-	if err := s.db.WithContext(ctx).Where("hr_id = ?", hrID).Order("created_at DESC").Limit(limit).Find(&rows).Error; err != nil {
+func (s *Server) memoryContextMessages(ctx context.Context, hrID uint64, currentQuestion string) ([]*schema.Message, error) {
+	rounds := s.memoryRounds
+	if rounds <= 0 {
+		rounds = 5
+	}
+	summary, err := s.loadMemorySummary(ctx, hrID)
+	if err != nil {
 		return nil, err
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].CreatedAt.Before(rows[j].CreatedAt) })
+	recentTurnIDs, err := s.recentTurnIDs(ctx, hrID, rounds)
+	if err != nil {
+		return nil, err
+	}
+	pendingRows, err := s.pendingUnsummarizedRows(ctx, hrID, summary.LastSummarizedAt, recentTurnIDs)
+	if err != nil {
+		return nil, err
+	}
+	recentRows, err := s.chatRowsForTurns(ctx, hrID, recentTurnIDs, rounds)
+	if err != nil {
+		return nil, err
+	}
+
+	messages := s.buildMemoryMessages(summary.Summary, pendingRows, recentRows)
+	if len(pendingRows) > 0 && estimateMessagesTokens(messages, currentQuestion) >= s.memoryTriggerTokens {
+		newSummary, summarizeErr := s.summarizePendingRows(ctx, hrID, summary, pendingRows)
+		if summarizeErr != nil {
+			return nil, fmt.Errorf("summarize chat memory: %w", summarizeErr)
+		}
+		messages = s.buildMemoryMessages(newSummary.Summary, nil, recentRows)
+	}
+	return messages, nil
+}
+
+func (s *Server) loadMemorySummary(ctx context.Context, hrID uint64) (domain.ChatMemorySummary, error) {
+	var summary domain.ChatMemorySummary
+	err := s.db.WithContext(ctx).First(&summary, "hr_id = ?", hrID).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return domain.ChatMemorySummary{HRID: hrID}, nil
+	}
+	return summary, err
+}
+
+func (s *Server) recentTurnIDs(ctx context.Context, hrID uint64, rounds int) ([]string, error) {
+	type turnRow struct {
+		TurnID       string
+		MaxCreatedAt time.Time
+	}
+	var turns []turnRow
+	if err := s.db.WithContext(ctx).Model(&domain.ChatMessage{}).
+		Select("turn_id, MAX(created_at) AS max_created_at").
+		Where("hr_id = ? AND turn_id <> ?", hrID, "").
+		Group("turn_id").
+		Order("max_created_at DESC").
+		Limit(rounds).
+		Scan(&turns).Error; err != nil {
+		return nil, err
+	}
+	turnIDs := make([]string, 0, len(turns))
+	for _, turn := range turns {
+		turnIDs = append(turnIDs, turn.TurnID)
+	}
+	return turnIDs, nil
+}
+
+func (s *Server) pendingUnsummarizedRows(ctx context.Context, hrID uint64, after time.Time, recentTurnIDs []string) ([]domain.ChatMessage, error) {
+	q := s.db.WithContext(ctx).
+		Where("hr_id = ? AND turn_id <> ? AND created_at > ?", hrID, "", after)
+	if len(recentTurnIDs) > 0 {
+		q = q.Where("turn_id NOT IN ?", recentTurnIDs)
+	}
+	var rows []domain.ChatMessage
+	if err := q.Order("created_at ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (s *Server) chatRowsForTurns(ctx context.Context, hrID uint64, turnIDs []string, fallbackRounds int) ([]domain.ChatMessage, error) {
+	var rows []domain.ChatMessage
+	if len(turnIDs) > 0 {
+		if err := s.db.WithContext(ctx).Where("hr_id = ? AND turn_id IN ?", hrID, turnIDs).
+			Order("created_at ASC").Find(&rows).Error; err != nil {
+			return nil, err
+		}
+	} else {
+		if err := s.db.WithContext(ctx).Where("hr_id = ?", hrID).Order("created_at DESC").Limit(fallbackRounds * 2).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].CreatedAt.Before(rows[j].CreatedAt) })
+	}
+	return rows, nil
+}
+
+func (s *Server) buildMemoryMessages(summary string, pendingRows []domain.ChatMessage, recentRows []domain.ChatMessage) []*schema.Message {
+	messages := make([]*schema.Message, 0, len(pendingRows)+len(recentRows)+1)
+	if strings.TrimSpace(summary) != "" {
+		messages = append(messages, schema.SystemMessage(memorySummaryContext(summary)))
+	}
+	messages = append(messages, s.chatRowsToMessages(pendingRows)...)
+	messages = append(messages, s.chatRowsToMessages(recentRows)...)
+	return messages
+}
+
+func (s *Server) chatRowsToMessages(rows []domain.ChatMessage) []*schema.Message {
 	messages := make([]*schema.Message, 0, len(rows))
 	for _, row := range rows {
 		switch row.Role {
 		case domain.ChatRoleUser:
 			messages = append(messages, schema.UserMessage(row.Content))
+		case domain.ChatRoleTool:
+			messages = append(messages, schema.SystemMessage(toolMemoryContent(row, s.showToolResults)))
 		case domain.ChatRoleAssistant:
 			messages = append(messages, schema.AssistantMessage(row.Content, nil))
 		}
 	}
-	return messages, nil
+	return messages
+}
+
+func (s *Server) summarizePendingRows(ctx context.Context, hrID uint64, summary domain.ChatMemorySummary, rows []domain.ChatMessage) (domain.ChatMemorySummary, error) {
+	if s.ai == nil {
+		return summary, fmt.Errorf("ai client is nil")
+	}
+	if len(rows) == 0 {
+		return summary, nil
+	}
+	pendingText := rowsForSummary(rows)
+	if pendingText == "" {
+		return summary, nil
+	}
+	newText, err := s.ai.SummarizeMemory(ctx, summary.Summary, pendingText)
+	if err != nil {
+		return summary, err
+	}
+	summary.HRID = hrID
+	summary.Summary = newText
+	summary.LastSummarizedAt = rows[len(rows)-1].CreatedAt
+	summary.SummaryVersion = 1
+	if err := s.db.WithContext(ctx).Save(&summary).Error; err != nil {
+		return summary, err
+	}
+	return summary, nil
+}
+
+func memorySummaryContext(summary string) string {
+	return fmt.Sprintf("以下是前文滚动摘要，仅用于理解用户长期意图、偏好和已确认设计；其中涉及实时招聘数据的内容不可直接作为事实使用，必须重新调用工具查询。\n\n%s", strings.TrimSpace(summary))
+}
+
+func rowsForSummary(rows []domain.ChatMessage) string {
+	var b strings.Builder
+	for _, row := range rows {
+		switch row.Role {
+		case domain.ChatRoleUser:
+			b.WriteString("用户：")
+			b.WriteString(strings.TrimSpace(row.Content))
+			b.WriteString("\n")
+		case domain.ChatRoleAssistant:
+			b.WriteString("助手：")
+			b.WriteString(strings.TrimSpace(row.Content))
+			b.WriteString("\n")
+		case domain.ChatRoleTool:
+			toolName := row.ToolName
+			if toolName == "" {
+				toolName = toolNameFromRecord(row.Content)
+			}
+			if toolName == "" {
+				toolName = "unknown"
+			}
+			b.WriteString("工具调用：")
+			b.WriteString(toolName)
+			b.WriteString("（工具参数和结果不写入长期摘要；涉及实时数据需重新查询）\n")
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func toolNameFromRecord(content string) string {
+	var record ai.ToolCallRecord
+	if err := json.Unmarshal([]byte(content), &record); err != nil {
+		return ""
+	}
+	return record.Name
+}
+
+func estimateMessagesTokens(messages []*schema.Message, currentQuestion string) int {
+	total := estimateTextTokens(currentQuestion)
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		total += estimateTextTokens(msg.Content)
+		total += 4
+	}
+	return total
+}
+
+func estimateTextTokens(value string) int {
+	tokens := 0
+	asciiRunes := 0
+	for _, r := range value {
+		if r <= 127 {
+			asciiRunes++
+			continue
+		}
+		if asciiRunes > 0 {
+			tokens += (asciiRunes + 3) / 4
+			asciiRunes = 0
+		}
+		tokens++
+	}
+	if asciiRunes > 0 {
+		tokens += (asciiRunes + 3) / 4
+	}
+	return tokens
+}
+
+func chatTurnRecords(hrID uint64, turnID string, question string, answer string, tools []ai.ToolCallRecord, now time.Time) []domain.ChatMessage {
+	records := make([]domain.ChatMessage, 0, len(tools)+2)
+	records = append(records, domain.ChatMessage{
+		HRID:      hrID,
+		TurnID:    turnID,
+		Role:      domain.ChatRoleUser,
+		Content:   question,
+		CreatedAt: now,
+	})
+	for i, toolCall := range tools {
+		records = append(records, domain.ChatMessage{
+			HRID:      hrID,
+			TurnID:    turnID,
+			Role:      domain.ChatRoleTool,
+			ToolName:  toolCall.Name,
+			Content:   marshalToolRecord(toolCall),
+			CreatedAt: now.Add(time.Duration(i+1) * time.Millisecond),
+		})
+	}
+	records = append(records, domain.ChatMessage{
+		HRID:      hrID,
+		TurnID:    turnID,
+		Role:      domain.ChatRoleAssistant,
+		Content:   answer,
+		CreatedAt: now.Add(time.Duration(len(tools)+1) * time.Millisecond),
+	})
+	return records
+}
+
+func chatTurnID(now time.Time) string {
+	return fmt.Sprintf("%d", now.UnixNano())
+}
+
+func marshalToolRecord(record ai.ToolCallRecord) string {
+	record.Arguments = truncateForChatMemory(record.Arguments)
+	record.Result = truncateForChatMemory(record.Result)
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Sprintf(`{"name":%q,"error":%q}`, record.Name, err.Error())
+	}
+	return string(data)
+}
+
+func toolMemoryContent(row domain.ChatMessage, includeResult bool) string {
+	toolName := row.ToolName
+	if toolName == "" {
+		toolName = "unknown"
+	}
+	var record ai.ToolCallRecord
+	if err := json.Unmarshal([]byte(row.Content), &record); err != nil {
+		if includeResult {
+			return fmt.Sprintf("历史工具调用记录：tool=%s result=%s", toolName, truncateForChatMemory(row.Content))
+		}
+		return fmt.Sprintf("历史工具调用记录：tool=%s result=[历史检索结果已隐藏，请根据当前问题重新检索]", toolName)
+	}
+	if record.Name != "" {
+		toolName = record.Name
+	}
+	result := "[历史检索结果已隐藏，请根据当前问题重新检索]"
+	if includeResult {
+		result = truncateForChatMemory(record.Result)
+		if record.Error != "" {
+			result = "error: " + record.Error
+		}
+	}
+	return fmt.Sprintf("历史工具调用记录：tool=%s arguments=%s result=%s", toolName, truncateForChatMemory(record.Arguments), result)
+}
+
+func truncateForChatMemory(value string) string {
+	const max = 12000
+	value = strings.TrimSpace(value)
+	if len([]rune(value)) <= max {
+		return value
+	}
+	return string([]rune(value)[:max]) + "...[truncated]"
 }
 
 func requireRole(actor *rpc.Actor, role string) error {

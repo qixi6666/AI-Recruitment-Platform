@@ -46,7 +46,13 @@ func main() {
 		log.Fatalf("listen %s: %v", cfg.GRPCAddr, err)
 	}
 	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(loggingUnaryInterceptor))
-	rpc.RegisterLogicServiceServer(grpcServer, service.NewServer(db, ai.NewClient(cfg.AI, db)))
+	rpc.RegisterLogicServiceServer(grpcServer, service.NewServer(
+		db,
+		ai.NewClient(cfg.AI, db),
+		service.WithMemoryRounds(cfg.AI.MemoryRounds),
+		service.WithMemoryTriggerTokens(cfg.AI.MemoryTriggerTokens),
+		service.WithShowToolResults(cfg.AI.ShowToolResults),
+	))
 	healthServer := healthgrpc.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
