@@ -1,8 +1,51 @@
-**/config.json
+# Local secrets and machine-specific config
 .env
+.env.*
+!.env.example
 **/.env
+**/.env.*
+!**/.env.example
+**/config.json
+
+# Local agent/runtime state
+.codex/
+.venv/
+.venv-*/
+venv/
+env/
+
+# Frontend dependencies and build output
 **/node_modules/
 **/dist/
-uploads/
-DEVELOPMENT_PROGRESS.md
+**/.vite/
+**/coverage/
 
+# Go build/test artifacts
+bin/
+build/
+tmp/
+*.test
+*.out
+coverage.out
+
+# Runtime data, uploads, and Docker volumes
+uploads/
+volumes/
+*.log
+*.pid
+
+# Ragas/local evaluation outputs
+eval/ragas/outputs/
+**/__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local notes
+DEVELOPMENT_PROGRESS.md

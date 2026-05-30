@@ -80,6 +80,24 @@ type Application struct {
 	UpdatedAt time.Time
 }
 
+type ResumeExperienceChunk struct {
+	ID              uint64 `gorm:"primaryKey"`
+	HRID            uint64 `gorm:"not null;index:idx_resume_exp_chunks_hr_job,priority:1;uniqueIndex:idx_resume_exp_chunks_unique,priority:1"`
+	JobID           uint64 `gorm:"not null;index:idx_resume_exp_chunks_hr_job,priority:2;uniqueIndex:idx_resume_exp_chunks_unique,priority:2"`
+	ApplicationID   uint64 `gorm:"not null;index"`
+	ResumeID        uint64 `gorm:"not null;index;uniqueIndex:idx_resume_exp_chunks_unique,priority:3"`
+	CandidateID     uint64 `gorm:"not null;index"`
+	SectionType     string `gorm:"size:64;not null;uniqueIndex:idx_resume_exp_chunks_unique,priority:4"`
+	SectionTitle    string `gorm:"size:255;not null"`
+	ExperienceIndex int    `gorm:"not null;uniqueIndex:idx_resume_exp_chunks_unique,priority:5"`
+	ChunkIndex      int    `gorm:"not null;uniqueIndex:idx_resume_exp_chunks_unique,priority:6"`
+	KeywordText     string `gorm:"type:text;not null"`
+	EvidenceText    string `gorm:"type:text;not null"`
+	OriginalText    string `gorm:"type:text"`
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 type ChatMessage struct {
 	ID        uint64    `gorm:"primaryKey"`
 	HRID      uint64    `gorm:"not null;index;index:idx_chat_messages_hr_created,priority:1;index:idx_chat_messages_hr_turn_created,priority:1"`

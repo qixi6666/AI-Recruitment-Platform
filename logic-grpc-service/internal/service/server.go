@@ -399,11 +399,8 @@ func (s *Server) AIChat(ctx context.Context, req *rpc.AIChatRequest) (*rpc.AICha
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &rpc.AIChatResponse{
-		Answer: answer.Answer,
-		Context: map[string]string{
-			"agent":      "ChatModelAgent",
-			"used_tools": strings.Join(answer.UsedTools, ","),
-		},
+		Answer:  answer.Answer,
+		Context: s.aiResponseContext(answer),
 	}, nil
 }
 
@@ -438,12 +435,20 @@ func (s *Server) AIChatStream(req *rpc.AIChatRequest, stream rpc.LogicService_AI
 		return status.Error(codes.Internal, err.Error())
 	}
 	return stream.Send(&rpc.AIChatStreamChunk{
-		Done: true,
-		Context: map[string]string{
-			"agent":      "ChatModelAgent",
-			"used_tools": strings.Join(answer.UsedTools, ","),
-		},
+		Done:    true,
+		Context: s.aiResponseContext(answer),
 	})
+}
+
+func (s *Server) aiResponseContext(answer ai.AgentAnswer) map[string]string {
+	context := map[string]string{
+		"agent":      "ChatModelAgent",
+		"used_tools": strings.Join(answer.UsedTools, ","),
+	}
+	if s.showToolResults {
+		context["tool_calls"] = toolCallsContext(answer.ToolCalls)
+	}
+	return context
 }
 
 func (s *Server) ListChatHistory(ctx context.Context, req *rpc.ListChatHistoryRequest) (*rpc.ListChatHistoryResponse, error) {
@@ -723,6 +728,17 @@ func marshalToolRecord(record ai.ToolCallRecord) string {
 	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Sprintf(`{"name":%q,"error":%q}`, record.Name, err.Error())
+	}
+	return string(data)
+}
+
+func toolCallsContext(records []ai.ToolCallRecord) string {
+	if len(records) == 0 {
+		return "[]"
+	}
+	data, err := json.Marshal(records)
+	if err != nil {
+		return "[]"
 	}
 	return string(data)
 }

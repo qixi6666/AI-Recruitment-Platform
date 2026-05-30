@@ -1,0 +1,10 @@
+.git
+.codex
+.agents
+volumes
+uploads
+**/node_modules
+**/dist
+**/.DS_Store
+**/*.log
+/tmp

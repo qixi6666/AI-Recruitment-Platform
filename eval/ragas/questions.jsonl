@@ -1,0 +1,3 @@
+{"query_id":"q001","user_input":"请基于岗位 JD 和候选人自填项目/工作经历证据，推荐熟悉 Go、gRPC、MySQL、高并发接口优化的后端候选人，并说明证据。"}
+{"query_id":"q002","user_input":"请调用候选人经历语义检索或 JD 推荐工具，找出做过 RAG、Milvus、Embedding 或向量检索的候选人，并引用项目/工作经历证据。"}
+{"query_id":"q003","user_input":"请必须调用 semantic_search_resumes 检索候选人自填项目/工作经历，query 使用 Redis 缓存优化 接口性能优化，然后找出相关候选人并引用证据。"}
