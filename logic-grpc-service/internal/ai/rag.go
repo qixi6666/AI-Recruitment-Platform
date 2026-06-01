@@ -25,7 +25,6 @@ import (
 
 const (
 	resumeChunkSize                 = 900
-	resumeChunkOverlap              = 100
 	resumeMaxChunks                 = 80
 	embeddingBatchSize              = 16
 	recommendationSemanticWeight    = 0.65
@@ -67,8 +66,7 @@ func (c *Client) IndexApplicationResume(ctx context.Context, hrID, jobID, applic
 	if err != nil {
 		return err
 	}
-	text := profileExperienceText(profile)
-	chunks := buildExperienceChunks(text)
+	chunks := buildExperienceChunksFromProfile(profile)
 	if len(chunks) == 0 {
 		return fmt.Errorf("candidate profile has no project/work experience chunks")
 	}
@@ -160,24 +158,6 @@ func (c *Client) IndexApplicationResume(ctx context.Context, hrID, jobID, applic
 		return fmt.Errorf("insert resume chunks: %w", err)
 	}
 	return nil
-}
-
-func profileExperienceText(profile domain.CandidateProfile) string {
-	var b strings.Builder
-	if strings.TrimSpace(profile.WorkExperience) != "" {
-		b.WriteString("## 工作经历\n\n")
-		b.WriteString(strings.TrimSpace(profile.WorkExperience))
-		b.WriteString("\n\n")
-	}
-	if strings.TrimSpace(profile.ProjectExperience) != "" {
-		b.WriteString("## 项目经历\n\n")
-		b.WriteString(strings.TrimSpace(profile.ProjectExperience))
-		b.WriteString("\n\n")
-	}
-	if b.Len() == 0 {
-		b.WriteString(strings.TrimSpace(profile.Experience))
-	}
-	return normalizeResumeLines(b.String())
 }
 
 func (c *Client) resumeExperienceChunkIDs(ctx context.Context, hrID, jobID, applicationID uint64) ([]uint64, error) {
@@ -848,39 +828,40 @@ func normalizeResumeLines(value string) string {
 	return strings.TrimSpace(strings.Join(out, "\n"))
 }
 
-func buildExperienceChunks(text string) []resumeExperienceChunk {
-	lines := meaningfulResumeLines(text)
-	sections := detectResumeSections(lines)
+func buildExperienceChunksFromProfile(profile domain.CandidateProfile) []resumeExperienceChunk {
 	chunks := make([]resumeExperienceChunk, 0, resumeMaxChunks)
+	sections := []resumeSection{
+		{
+			Type:  "work",
+			Title: "工作经历",
+			Lines: meaningfulResumeLines(profile.WorkExperience),
+			Index: 1,
+		},
+		{
+			Type:  "project",
+			Title: "项目经历",
+			Lines: meaningfulResumeLines(profile.ProjectExperience),
+			Index: 1,
+		},
+	}
+	if len(sections[0].Lines) == 0 && len(sections[1].Lines) == 0 {
+		sections = []resumeSection{{
+			Type:  "experience",
+			Title: "经历证据",
+			Lines: meaningfulResumeLines(profile.Experience),
+			Index: 1,
+		}}
+	}
 	for _, section := range sections {
+		if len(section.Lines) == 0 {
+			continue
+		}
 		sectionChunks := chunkExperienceSection(section)
 		for _, chunk := range sectionChunks {
 			chunks = append(chunks, chunk)
 			if len(chunks) >= resumeMaxChunks {
 				return chunks
 			}
-		}
-	}
-	if len(chunks) > 0 {
-		return chunks
-	}
-	fallback := fallbackExperienceText(lines)
-	if fallback == "" {
-		return nil
-	}
-	parts := splitResumeChunks(fallback)
-	for i, part := range parts {
-		content := "## 项目/实习经历\n\n" + part
-		chunks = append(chunks, resumeExperienceChunk{
-			SectionType:     "experience",
-			SectionTitle:    "项目/实习经历",
-			ExperienceIndex: 0,
-			ChunkIndex:      i,
-			Content:         content,
-			SearchText:      buildSearchText("experience", "项目/实习经历", content),
-		})
-		if len(chunks) >= resumeMaxChunks {
-			break
 		}
 	}
 	return chunks
@@ -905,59 +886,16 @@ func meaningfulResumeLines(text string) []string {
 	return lines
 }
 
-func detectResumeSections(lines []string) []resumeSection {
-	var sections []resumeSection
-	current := resumeSection{}
-	nextIndex := map[string]int{}
-	for _, line := range lines {
-		if sectionType, title, ok := classifyResumeHeading(line); ok {
-			if current.Type != "" && len(current.Lines) > 0 {
-				sections = append(sections, current)
-			}
-			nextIndex[sectionType]++
-			current = resumeSection{Type: sectionType, Title: title, Index: nextIndex[sectionType]}
-			continue
-		}
-		if current.Type != "" {
-			current.Lines = append(current.Lines, line)
-		}
-	}
-	if current.Type != "" && len(current.Lines) > 0 {
-		sections = append(sections, current)
-	}
-	return sections
-}
-
-func classifyResumeHeading(line string) (string, string, bool) {
-	normalized := strings.ToLower(strings.Trim(line, "#:：|- "))
-	compact := strings.ReplaceAll(normalized, " ", "")
-	if len([]rune(compact)) > 24 {
-		return "", "", false
-	}
-	switch {
-	case containsAny(compact, []string{"项目经历", "项目经验", "项目实践", "项目介绍"}):
-		return "project", "项目经历", true
-	case containsAny(compact, []string{"实习经历", "实习经验"}):
-		return "internship", "实习经历", true
-	case containsAny(compact, []string{"工作经历", "工作经验", "任职经历"}):
-		return "work", "工作经历", true
-	}
-	return "", "", false
-}
-
 func chunkExperienceSection(section resumeSection) []resumeExperienceChunk {
 	body := strings.Join(section.Lines, "\n")
 	if body == "" {
 		return nil
 	}
 	title := section.Title
-	if len(section.Lines) > 0 && looksLikeExperienceTitle(section.Lines[0]) {
-		title = section.Lines[0]
-	}
 	parts := splitResumeChunks(body)
 	chunks := make([]resumeExperienceChunk, 0, len(parts))
 	for i, part := range parts {
-		content := fmt.Sprintf("## %s：%s\n\n%s", markdownSectionName(section.Type), title, part)
+		content := fmt.Sprintf("%s\n\n%s", title, part)
 		chunks = append(chunks, resumeExperienceChunk{
 			SectionType:     section.Type,
 			SectionTitle:    title,
@@ -968,26 +906,6 @@ func chunkExperienceSection(section resumeSection) []resumeExperienceChunk {
 		})
 	}
 	return chunks
-}
-
-func markdownSectionName(sectionType string) string {
-	switch sectionType {
-	case "project":
-		return "项目经历"
-	case "internship":
-		return "实习经历"
-	case "work":
-		return "工作经历"
-	default:
-		return "经历证据"
-	}
-}
-
-func looksLikeExperienceTitle(line string) bool {
-	if len([]rune(line)) > 80 {
-		return false
-	}
-	return containsAny(line, []string{"项目", "系统", "平台", "公司", "实习", "工作", "开发", "工程师"})
 }
 
 func buildSearchText(sectionType, title, content string) string {
@@ -1053,40 +971,89 @@ func hasASCIIAlphaNum(value string) bool {
 	return false
 }
 
-func fallbackExperienceText(lines []string) string {
-	selected := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if containsAny(line, []string{"项目", "系统", "平台", "实习", "工作", "负责", "开发", "实现", "优化", "技术栈", "后端", "前端", "数据库", "微服务", "高并发"}) {
-			selected = append(selected, line)
-		}
-	}
-	if len(selected) < 2 {
-		return ""
-	}
-	return strings.Join(selected, "\n")
-}
-
-func containsAny(value string, keywords []string) bool {
-	value = strings.ToLower(value)
-	for _, keyword := range keywords {
-		if strings.Contains(value, strings.ToLower(keyword)) {
-			return true
-		}
-	}
-	return false
-}
-
 func splitResumeChunks(text string) []string {
-	runes := []rune(normalizeResumeText(text))
+	text = normalizeResumeLines(text)
+	if text == "" {
+		return nil
+	}
+	chunks := recursiveSplitResumeChunks(text, []string{"\n\n", "\n", "。", "；", "，", " "})
+	out := make([]string, 0, minInt(len(chunks), resumeMaxChunks))
+	for _, chunk := range chunks {
+		chunk = normalizeResumeText(chunk)
+		if chunk == "" {
+			continue
+		}
+		out = append(out, chunk)
+		if len(out) >= resumeMaxChunks {
+			break
+		}
+	}
+	return out
+}
+
+func recursiveSplitResumeChunks(text string, separators []string) []string {
+	runes := []rune(strings.TrimSpace(text))
 	if len(runes) == 0 {
 		return nil
 	}
+	if len(runes) <= resumeChunkSize {
+		return []string{strings.TrimSpace(text)}
+	}
+	if len(separators) == 0 {
+		return splitLongTextByWindow(text)
+	}
+
+	separator := separators[0]
+	rawParts := strings.Split(text, separator)
+	parts := make([]string, 0, len(rawParts))
+	for _, part := range rawParts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	if len(parts) <= 1 {
+		return recursiveSplitResumeChunks(text, separators[1:])
+	}
+
+	var chunks []string
+	var current strings.Builder
+	flush := func() {
+		value := strings.TrimSpace(current.String())
+		if value != "" {
+			chunks = append(chunks, value)
+		}
+		current.Reset()
+	}
+	for _, part := range parts {
+		partLen := len([]rune(part))
+		if partLen > resumeChunkSize {
+			flush()
+			chunks = append(chunks, recursiveSplitResumeChunks(part, separators[1:])...)
+			continue
+		}
+		next := part
+		if current.Len() > 0 && separator != " " {
+			next = separator + part
+		} else if current.Len() > 0 {
+			next = " " + part
+		}
+		if len([]rune(current.String()+next)) > resumeChunkSize {
+			flush()
+			current.WriteString(part)
+			continue
+		}
+		current.WriteString(next)
+	}
+	flush()
+	return chunks
+}
+
+func splitLongTextByWindow(text string) []string {
+	runes := []rune(normalizeResumeText(text))
 	chunks := make([]string, 0, minInt(resumeMaxChunks, len(runes)/resumeChunkSize+1))
 	for start := 0; start < len(runes) && len(chunks) < resumeMaxChunks; {
-		end := start + resumeChunkSize
-		if end > len(runes) {
-			end = len(runes)
-		}
+		end := minInt(start+resumeChunkSize, len(runes))
 		chunk := strings.TrimSpace(string(runes[start:end]))
 		if chunk != "" {
 			chunks = append(chunks, chunk)
@@ -1094,11 +1061,7 @@ func splitResumeChunks(text string) []string {
 		if end == len(runes) {
 			break
 		}
-		next := end - resumeChunkOverlap
-		if next <= start {
-			next = end
-		}
-		start = next
+		start = end
 	}
 	return chunks
 }
