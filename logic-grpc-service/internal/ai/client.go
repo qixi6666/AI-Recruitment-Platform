@@ -134,7 +134,14 @@ func (c *Client) StreamWithTools(ctx context.Context, hrID uint64, question stri
 		return AgentAnswer{}, err
 	}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent, EnableStreaming: true})
-	messages := make([]adk.Message, 0, len(history)+1)
+	jobContext, err := c.hrJobDirectoryContext(ctx, hrID)
+	if err != nil {
+		return AgentAnswer{}, err
+	}
+	messages := make([]adk.Message, 0, len(history)+2)
+	if jobContext != "" {
+		messages = append(messages, schema.SystemMessage(jobContext))
+	}
 	messages = append(messages, history...)
 	messages = append(messages, schema.UserMessage(question))
 	iter := runner.Run(ctx, messages)
@@ -172,6 +179,36 @@ func (c *Client) StreamWithTools(ctx context.Context, hrID uint64, question stri
 	return AgentAnswer{UsedTools: tracker.names(), ToolCalls: tracker.recordsSnapshot()}, nil
 }
 
+func (c *Client) hrJobDirectoryContext(ctx context.Context, hrID uint64) (string, error) {
+	type jobBrief struct {
+		ID     uint64
+		Title  string
+		City   string
+		Status string
+	}
+	var jobs []jobBrief
+	if err := c.db.WithContext(ctx).
+		Model(&domain.Job{}).
+		Select("id, title, city, status").
+		Where("hr_id = ?", hrID).
+		Order("created_at DESC").
+		Limit(50).
+		Scan(&jobs).Error; err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString("当前 HR 名下岗位目录如下，仅可使用这些岗位 ID 调用工具；如果用户提到的岗位无法唯一匹配，请先让用户确认岗位。\n")
+	if len(jobs) == 0 {
+		b.WriteString("当前 HR 暂无岗位。\n")
+		return b.String(), nil
+	}
+	for _, job := range jobs {
+		b.WriteString(fmt.Sprintf("- job_id=%d，岗位名称=%s，城市=%s，状态=%s\n", job.ID, job.Title, job.City, job.Status))
+	}
+	return b.String(), nil
+}
+
 func consumeAssistantStream(stream adk.MessageStream, onChunk func(string) error) error {
 	if stream == nil {
 		return nil
@@ -202,6 +239,7 @@ func buildInstruction() string {
 	b.WriteString("涉及统计时调用 get_recruitment_stats；涉及结构化候选人筛选时调用 search_candidates；不要编造候选人、岗位、投递数量、简历附件或经历数据。\n")
 	b.WriteString("当问题涉及候选人填写的项目经历、工作经历、业务背景、技术细节等非结构化内容时，优先调用 semantic_search_resumes 工具。\n")
 	b.WriteString("当 HR 要求推荐候选人或按岗位 JD 匹配简历时，调用 recommend_resumes_by_jd；你需要基于工具返回的候选人自填项目/工作证据判断匹配度、给出评分、推荐理由和风险点，不要编造证据。\n")
+	b.WriteString("每轮对话会注入当前 HR 名下岗位目录；当用户按已有岗位推荐候选人时，只能从该目录选择唯一匹配的 job_id。若岗位名称不明确或匹配多个岗位，先询问用户确认；若用户直接粘贴 JD，则使用 job_description，不要编造 job_id。\n")
 	b.WriteString("历史工具调用记录只用于理解上下文；涉及当前统计、筛选和推荐时仍以本轮工具返回结果为准。\n")
 	b.WriteString("工具已经按当前 HR 账号做了数据隔离，你不能要求或推断其他 HR 的数据。\n")
 	b.WriteString("最终回答使用中文，简洁、结构化，明确说明查询口径来自当前 HR 创建的岗位。\n")

@@ -584,7 +584,7 @@ func (s *Server) chatRowsToMessages(rows []domain.ChatMessage) []*schema.Message
 		case domain.ChatRoleUser:
 			messages = append(messages, schema.UserMessage(row.Content))
 		case domain.ChatRoleTool:
-			messages = append(messages, schema.SystemMessage(toolMemoryContent(row, s.showToolResults)))
+			messages = append(messages, schema.SystemMessage(toolMemoryContent(row)))
 		case domain.ChatRoleAssistant:
 			messages = append(messages, schema.AssistantMessage(row.Content, nil))
 		}
@@ -743,29 +743,39 @@ func toolCallsContext(records []ai.ToolCallRecord) string {
 	return string(data)
 }
 
-func toolMemoryContent(row domain.ChatMessage, includeResult bool) string {
+func toolMemoryContent(row domain.ChatMessage) string {
 	toolName := row.ToolName
 	if toolName == "" {
 		toolName = "unknown"
 	}
 	var record ai.ToolCallRecord
 	if err := json.Unmarshal([]byte(row.Content), &record); err != nil {
-		if includeResult {
-			return fmt.Sprintf("历史工具调用记录：tool=%s result=%s", toolName, truncateForChatMemory(row.Content))
-		}
-		return fmt.Sprintf("历史工具调用记录：tool=%s result=[历史检索结果已隐藏，请根据当前问题重新检索]", toolName)
+		return fmt.Sprintf("历史工具调用记录：tool=%s result=%s", toolName, toolMemoryResult(toolName, row.Content, ""))
 	}
 	if record.Name != "" {
 		toolName = record.Name
 	}
-	result := "[历史检索结果已隐藏，请根据当前问题重新检索]"
-	if includeResult {
-		result = truncateForChatMemory(record.Result)
-		if record.Error != "" {
-			result = "error: " + record.Error
-		}
-	}
+	result := toolMemoryResult(toolName, record.Result, record.Error)
 	return fmt.Sprintf("历史工具调用记录：tool=%s arguments=%s result=%s", toolName, truncateForChatMemory(record.Arguments), result)
+}
+
+func toolMemoryResult(toolName, result, recordError string) string {
+	if isRAGTool(toolName) {
+		return "[RAG 检索/推荐结果已隐藏，请根据当前问题重新检索]"
+	}
+	if recordError != "" {
+		return "error: " + recordError
+	}
+	return truncateForChatMemory(result)
+}
+
+func isRAGTool(toolName string) bool {
+	switch toolName {
+	case "semantic_search_resumes", "recommend_resumes_by_jd":
+		return true
+	default:
+		return false
+	}
 }
 
 func truncateForChatMemory(value string) string {

@@ -61,14 +61,16 @@ type CandidateSearchOutput struct {
 }
 
 type CandidateSearchItem struct {
-	Name       string `json:"name"`
-	Education  string `json:"education"`
-	School     string `json:"school"`
-	Skills     string `json:"skills"`
-	JobID      uint64 `json:"job_id"`
-	JobTitle   string `json:"job_title"`
-	AppliedAt  string `json:"applied_at"`
-	ResumeName string `json:"resume_name"`
+	CandidateID   uint64 `json:"candidate_id"`
+	ApplicationID uint64 `json:"application_id"`
+	Name          string `json:"name"`
+	Education     string `json:"education"`
+	School        string `json:"school"`
+	Skills        string `json:"skills"`
+	JobID         uint64 `json:"job_id"`
+	JobTitle      string `json:"job_title"`
+	AppliedAt     string `json:"applied_at"`
+	ResumeName    string `json:"resume_name"`
 }
 
 type ResumeSemanticSearchInput struct {
@@ -245,18 +247,20 @@ func normalizeRecruitmentStatsScope(scope string) string {
 func (c *Client) searchCandidatesTool(hrID uint64) func(context.Context, CandidateSearchInput) (CandidateSearchOutput, error) {
 	return func(ctx context.Context, input CandidateSearchInput) (CandidateSearchOutput, error) {
 		type candidateRow struct {
-			Name       string
-			Education  string
-			School     string
-			Skills     string
-			JobID      uint64
-			JobTitle   string
-			AppliedAt  time.Time
-			ResumeName string
+			CandidateID   uint64
+			ApplicationID uint64
+			Name          string
+			Education     string
+			School        string
+			Skills        string
+			JobID         uint64
+			JobTitle      string
+			AppliedAt     time.Time
+			ResumeName    string
 		}
 		var rows []candidateRow
 		q := c.db.WithContext(ctx).Table("applications").
-			Select("candidate_profiles.name, candidate_profiles.education, candidate_profiles.school, candidate_profiles.skills, jobs.id AS job_id, jobs.title AS job_title, applications.created_at AS applied_at, resumes.file_name AS resume_name").
+			Select("applications.user_id AS candidate_id, applications.id AS application_id, candidate_profiles.name, candidate_profiles.education, candidate_profiles.school, candidate_profiles.skills, jobs.id AS job_id, jobs.title AS job_title, applications.created_at AS applied_at, resumes.file_name AS resume_name").
 			Joins("JOIN jobs ON jobs.id = applications.job_id").
 			Joins("JOIN candidate_profiles ON candidate_profiles.user_id = applications.user_id").
 			Joins("JOIN resumes ON resumes.id = applications.resume_id").
@@ -280,7 +284,7 @@ func (c *Client) searchCandidatesTool(hrID uint64) func(context.Context, Candida
 		items := make([]CandidateSearchItem, 0, len(rows))
 		for _, row := range rows {
 			items = append(items, CandidateSearchItem{
-				Name: row.Name, Education: row.Education, School: row.School, Skills: row.Skills,
+				CandidateID: row.CandidateID, ApplicationID: row.ApplicationID, Name: row.Name, Education: row.Education, School: row.School, Skills: row.Skills,
 				JobID: row.JobID, JobTitle: row.JobTitle, AppliedAt: rpc.FormatTime(row.AppliedAt), ResumeName: row.ResumeName,
 			})
 		}
