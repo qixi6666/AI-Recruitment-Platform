@@ -13,10 +13,6 @@ const (
 	ResumeReady   = "ready"
 
 	ApplicationSubmitted = "submitted"
-
-	ChatRoleUser      = "user"
-	ChatRoleAssistant = "assistant"
-	ChatRoleTool      = "tool"
 )
 
 type User struct {
@@ -96,23 +92,4 @@ type ResumeExperienceChunk struct {
 	OriginalText    string `gorm:"type:text"`
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
-}
-
-type ChatMessage struct {
-	ID        uint64    `gorm:"primaryKey"`
-	HRID      uint64    `gorm:"not null;index;index:idx_chat_messages_hr_created,priority:1;index:idx_chat_messages_hr_turn_created,priority:1"`
-	TurnID    string    `gorm:"size:64;index:idx_chat_messages_hr_turn_created,priority:2"`
-	Role      string    `gorm:"size:32;not null"`
-	ToolName  string    `gorm:"size:128"`
-	Content   string    `gorm:"type:text;not null"`
-	CreatedAt time.Time `gorm:"index:idx_chat_messages_hr_created,priority:2;index:idx_chat_messages_hr_turn_created,priority:3"`
-}
-
-type ChatMemorySummary struct {
-	HRID             uint64 `gorm:"primaryKey"`
-	Summary          string `gorm:"type:text;not null"`
-	LastSummarizedAt time.Time
-	SummaryVersion   int `gorm:"not null;default:1"`
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
 }

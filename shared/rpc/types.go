@@ -205,39 +205,78 @@ type ListApplicationsResponse struct {
 	Total int64             `json:"total"`
 }
 
-type ChatMessageDTO struct {
-	ID        uint64 `json:"id"`
-	HRID      uint64 `json:"hr_id"`
-	TurnID    string `json:"turn_id,omitempty"`
-	Role      string `json:"role"`
-	ToolName  string `json:"tool_name,omitempty"`
-	Content   string `json:"content"`
-	CreatedAt string `json:"created_at"`
+type ResumeRecommendationRequest struct {
+	Actor          *Actor   `json:"actor"`
+	JobID          uint64   `json:"job_id"`
+	JobDescription string   `json:"job_description"`
+	Queries        []string `json:"queries"`
+	Limit          int32    `json:"limit"`
+	EvidenceLimit  int32    `json:"evidence_limit"`
 }
 
-type AIChatRequest struct {
-	Actor    *Actor `json:"actor"`
-	Question string `json:"question"`
+type ResumeRecommendationResponse struct {
+	Scope          string                              `json:"scope"`
+	JobID          uint64                              `json:"job_id,omitempty"`
+	JobTitle       string                              `json:"job_title,omitempty"`
+	AgentStatus    string                              `json:"agent_status"`
+	FallbackReason string                              `json:"fallback_reason,omitempty"`
+	Candidates     []*ResumeRecommendationCandidateDTO `json:"candidates"`
 }
 
-type AIChatResponse struct {
-	Answer  string            `json:"answer"`
-	Context map[string]string `json:"context"`
+type ResumeRecommendationTaskResponse struct {
+	TaskID    string                        `json:"task_id"`
+	Status    string                        `json:"status"`
+	CreatedAt string                        `json:"created_at,omitempty"`
+	StreamURL string                        `json:"stream_url,omitempty"`
+	Cached    bool                          `json:"cached,omitempty"`
+	Response  *ResumeRecommendationResponse `json:"response,omitempty"`
 }
 
-type AIChatStreamChunk struct {
-	Content string            `json:"content"`
-	Done    bool              `json:"done"`
-	Context map[string]string `json:"context,omitempty"`
+type ResumeRecommendationTaskWatchRequest struct {
+	Actor  *Actor `json:"actor"`
+	TaskID string `json:"task_id"`
 }
 
-type ListChatHistoryRequest struct {
-	Actor *Actor `json:"actor"`
-	Limit int32  `json:"limit"`
+type ResumeRecommendationStreamChunk struct {
+	TaskID   string                        `json:"task_id,omitempty"`
+	Status   string                        `json:"status,omitempty"`
+	Stage    string                        `json:"stage"`
+	Message  string                        `json:"message"`
+	Done     bool                          `json:"done"`
+	Response *ResumeRecommendationResponse `json:"response,omitempty"`
 }
 
-type ListChatHistoryResponse struct {
-	Items []*ChatMessageDTO `json:"items"`
+type ResumeRecommendationCandidateDTO struct {
+	CandidateID   uint64                          `json:"candidate_id"`
+	CandidateName string                          `json:"candidate_name"`
+	ResumeID      uint64                          `json:"resume_id"`
+	ResumeName    string                          `json:"resume_name"`
+	JobID         uint64                          `json:"job_id"`
+	JobTitle      string                          `json:"job_title"`
+	Score         float32                         `json:"score"`
+	SemanticScore float32                         `json:"semantic_score,omitempty"`
+	KeywordScore  float32                         `json:"keyword_score,omitempty"`
+	Reason        string                          `json:"reason,omitempty"`
+	RiskPoints    []string                        `json:"risk_points,omitempty"`
+	Evidence      []*ResumeRecommendationEvidence `json:"evidence"`
+}
+
+type ResumeRecommendationEvidence struct {
+	Score           float32 `json:"score"`
+	SemanticScore   float32 `json:"semantic_score,omitempty"`
+	KeywordScore    float32 `json:"keyword_score,omitempty"`
+	ChunkID         uint64  `json:"chunk_id"`
+	ResumeID        uint64  `json:"resume_id"`
+	JobID           uint64  `json:"job_id"`
+	JobTitle        string  `json:"job_title"`
+	CandidateID     uint64  `json:"candidate_id"`
+	CandidateName   string  `json:"candidate_name"`
+	SectionType     string  `json:"section_type"`
+	SectionTitle    string  `json:"section_title"`
+	ExperienceIndex int64   `json:"experience_index"`
+	ChunkIndex      int64   `json:"chunk_index"`
+	Content         string  `json:"content"`
+	ResumeName      string  `json:"resume_name"`
 }
 
 func FormatTime(t time.Time) string {

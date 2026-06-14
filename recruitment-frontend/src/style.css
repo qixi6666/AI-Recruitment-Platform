@@ -195,8 +195,7 @@ button {
 }
 
 .search-bar,
-.toolbar,
-.chat-form {
+.toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -234,8 +233,7 @@ textarea:focus {
   box-shadow: 0 0 0 3px rgba(47, 138, 116, 0.14);
 }
 
-.search-bar input,
-.chat-form input {
+.search-bar input {
   border: 0;
   min-height: 34px;
   padding: 6px;
@@ -514,71 +512,104 @@ label span {
   color: #2d7768;
 }
 
-.ai-panel {
-  display: grid;
-  gap: 14px;
+.recommendation-panel {
+	display: grid;
+	gap: 14px;
 }
 
-.chat-window {
-  display: grid;
-  align-content: start;
-  gap: 10px;
-  height: 360px;
-  overflow: auto;
-  padding: 14px;
-  border: 1px solid #dfe5df;
-  border-radius: 8px;
-  background: #f9fbf8;
+.recommend-form {
+	display: grid;
+	grid-template-columns: minmax(220px, 1fr) 120px 120px;
+	gap: 12px;
+	align-items: end;
 }
 
-.chat-bubble {
-  max-width: min(760px, 86%);
-  padding: 10px 12px;
-  border-radius: 8px;
+.span-3 {
+	grid-column: 1 / -1;
 }
 
-.chat-bubble span {
-  display: block;
-  margin-bottom: 4px;
-  font-size: 12px;
-  font-weight: 800;
+.recommendation-list {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 14px;
 }
 
-.chat-bubble p {
-  margin: 0;
-  white-space: pre-wrap;
+.recommendation-card {
+	display: grid;
+	gap: 12px;
+	padding: 16px;
+	border: 1px solid #dfe5df;
+	border-radius: 8px;
+	background: #ffffff;
 }
 
-.chat-bubble small {
-  display: block;
-  margin-top: 8px;
-  color: #57736c;
+.score-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	color: #57736c;
+	font-size: 13px;
+	font-weight: 700;
 }
 
-.chat-bubble.user {
-  justify-self: end;
-  color: #ffffff;
-  background: #206b5b;
+.recommendation-reason {
+	margin: 0;
+	color: #243832;
+	line-height: 1.7;
 }
 
-.chat-bubble.assistant {
-  justify-self: start;
-  background: #ffffff;
-  border: 1px solid #dfe5df;
+.final-answer-stream {
+	max-height: 180px;
+	margin: 0;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+	padding: 12px;
+	border: 1px solid #dfe5df;
+	border-radius: 8px;
+	background: #f9fbf8;
+	color: #243832;
+	font: inherit;
+	line-height: 1.6;
 }
 
-.chat-form {
-  padding: 6px;
-  border: 1px solid #dfe5df;
-  border-radius: 8px;
-  background: #ffffff;
+.risk-list {
+	margin: 0;
+	padding-left: 18px;
+	color: #7a4c19;
+	line-height: 1.6;
+}
+
+.evidence-list {
+	display: grid;
+	gap: 10px;
+}
+
+.evidence-item {
+	padding: 12px;
+	border: 1px solid #dfe5df;
+	border-radius: 8px;
+	background: #f9fbf8;
+}
+
+.evidence-item strong {
+	display: block;
+	margin-bottom: 6px;
+	color: #1d4d43;
+}
+
+.evidence-item p {
+	margin: 0;
+	color: #30443f;
+	white-space: pre-wrap;
 }
 
 @media (max-width: 1180px) {
-  .job-grid,
-  .application-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
+	.job-grid,
+	.application-grid,
+	.recommendation-list {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
 
   .hero-band {
     grid-template-columns: 1fr;
@@ -614,13 +645,15 @@ label span {
     align-items: stretch;
   }
 
-  .workspace-grid,
-  .form-grid.two,
-  .job-grid,
-  .application-grid,
-  .stat-strip {
-    grid-template-columns: 1fr;
-  }
+	.workspace-grid,
+	.form-grid.two,
+	.job-grid,
+	.application-grid,
+	.recommendation-list,
+	.recommend-form,
+	.stat-strip {
+		grid-template-columns: 1fr;
+	}
 
   .row-card,
   .job-row {

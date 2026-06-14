@@ -10,7 +10,15 @@ import (
 	"recruitment/shared/rpc"
 )
 
-func DialLogic(addr string) (*grpc.ClientConn, rpc.LogicServiceClient, error) {
+type LogicClients struct {
+	Auth            rpc.AuthServiceClient
+	Jobs            rpc.JobServiceClient
+	Candidates      rpc.CandidateServiceClient
+	Applications    rpc.ApplicationServiceClient
+	Recommendations rpc.ResumeRecommendationServiceClient
+}
+
+func DialLogic(addr string) (*grpc.ClientConn, LogicClients, error) {
 	conn, err := grpc.NewClient(
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -18,9 +26,15 @@ func DialLogic(addr string) (*grpc.ClientConn, rpc.LogicServiceClient, error) {
 		grpc.WithUnaryInterceptor(timeoutUnaryInterceptor),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, LogicClients{}, err
 	}
-	return conn, rpc.NewLogicServiceClient(conn), nil
+	return conn, LogicClients{
+		Auth:            rpc.NewAuthServiceClient(conn),
+		Jobs:            rpc.NewJobServiceClient(conn),
+		Candidates:      rpc.NewCandidateServiceClient(conn),
+		Applications:    rpc.NewApplicationServiceClient(conn),
+		Recommendations: rpc.NewResumeRecommendationServiceClient(conn),
+	}, nil
 }
 
 func timeoutUnaryInterceptor(ctx context.Context, method string, req any, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
@@ -28,7 +42,7 @@ func timeoutUnaryInterceptor(ctx context.Context, method string, req any, reply 
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
 	timeout := 8 * time.Second
-	if method == "/recruitment.LogicService/AIChat" {
+	if method == "/recruitment.ResumeRecommendationService/RecommendResumes" {
 		timeout = 60 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)

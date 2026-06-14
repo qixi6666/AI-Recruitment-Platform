@@ -12,21 +12,38 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 
 	"recruitment/shared/rpc"
+	"recruitment/web-gin-service/internal/client"
 	"recruitment/web-gin-service/internal/httputil"
 	"recruitment/web-gin-service/internal/middleware"
 )
 
 type Handler struct {
-	logic          rpc.LogicServiceClient
-	jwtSecret      string
-	jwtExpireHours int64
-	uploadDir      string
+	auth            rpc.AuthServiceClient
+	jobs            rpc.JobServiceClient
+	candidates      rpc.CandidateServiceClient
+	applications    rpc.ApplicationServiceClient
+	recommendations rpc.ResumeRecommendationServiceClient
+	redis           *redis.Client
+	jwtSecret       string
+	jwtExpireHours  int64
+	uploadDir       string
 }
 
-func New(logic rpc.LogicServiceClient, jwtSecret string, jwtExpireHours int64, uploadDir string) *Handler {
-	return &Handler{logic: logic, jwtSecret: jwtSecret, jwtExpireHours: jwtExpireHours, uploadDir: uploadDir}
+func New(logic client.LogicClients, redisClient *redis.Client, jwtSecret string, jwtExpireHours int64, uploadDir string) *Handler {
+	return &Handler{
+		auth:            logic.Auth,
+		jobs:            logic.Jobs,
+		candidates:      logic.Candidates,
+		applications:    logic.Applications,
+		recommendations: logic.Recommendations,
+		redis:           redisClient,
+		jwtSecret:       jwtSecret,
+		jwtExpireHours:  jwtExpireHours,
+		uploadDir:       uploadDir,
+	}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -53,9 +70,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	hr.PATCH("/jobs/:id/offline", h.OfflineJob)
 	hr.GET("/applications", h.ListHRApplications)
 	hr.GET("/resumes/:id/download", h.DownloadResume)
-	hr.POST("/ai/chat", h.AIChat)
-	hr.POST("/ai/chat/stream", h.AIChatStream)
-	hr.GET("/ai/history", h.ListChatHistory)
+	hr.POST("/resume-recommendations", h.RecommendResumes)
+	hr.POST("/resume-recommendations/stream", h.RecommendResumesStream)
+	hr.GET("/resume-recommendations/:task_id/stream", h.WatchResumeRecommendationTask)
 }
 
 func (h *Handler) Register(c *gin.Context) {
@@ -63,7 +80,7 @@ func (h *Handler) Register(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	resp, err := h.logic.Register(c.Request.Context(), &req)
+	resp, err := h.auth.Register(c.Request.Context(), &req)
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -76,7 +93,7 @@ func (h *Handler) Login(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	resp, err := h.logic.Login(c.Request.Context(), &req)
+	resp, err := h.auth.Login(c.Request.Context(), &req)
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -90,7 +107,7 @@ func (h *Handler) Login(c *gin.Context) {
 }
 
 func (h *Handler) ListPublicJobs(c *gin.Context) {
-	resp, err := h.logic.ListJobs(c.Request.Context(), &rpc.ListJobsRequest{
+	resp, err := h.jobs.ListJobs(c.Request.Context(), &rpc.ListJobsRequest{
 		Page: page(c), PageSize: pageSize(c), Status: "open", Keyword: c.Query("keyword"),
 	})
 	if err != nil {
@@ -102,7 +119,7 @@ func (h *Handler) ListPublicJobs(c *gin.Context) {
 
 func (h *Handler) ListHRJobs(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	resp, err := h.logic.ListJobs(c.Request.Context(), &rpc.ListJobsRequest{
+	resp, err := h.jobs.ListJobs(c.Request.Context(), &rpc.ListJobsRequest{
 		Page: page(c), PageSize: pageSize(c), Keyword: c.Query("keyword"), Status: c.Query("status"), Actor: actor, OnlyMine: true,
 	})
 	if err != nil {
@@ -119,7 +136,7 @@ func (h *Handler) CreateJob(c *gin.Context) {
 		return
 	}
 	req.Actor = actor
-	resp, err := h.logic.CreateJob(c.Request.Context(), &req)
+	resp, err := h.jobs.CreateJob(c.Request.Context(), &req)
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -135,7 +152,7 @@ func (h *Handler) UpdateJob(c *gin.Context) {
 	}
 	req.Actor = actor
 	req.ID = uint64(pathID(c))
-	resp, err := h.logic.UpdateJob(c.Request.Context(), &req)
+	resp, err := h.jobs.UpdateJob(c.Request.Context(), &req)
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -145,7 +162,7 @@ func (h *Handler) UpdateJob(c *gin.Context) {
 
 func (h *Handler) OfflineJob(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	resp, err := h.logic.OfflineJob(c.Request.Context(), &rpc.OfflineJobRequest{Actor: actor, ID: uint64(pathID(c))})
+	resp, err := h.jobs.OfflineJob(c.Request.Context(), &rpc.OfflineJobRequest{Actor: actor, ID: uint64(pathID(c))})
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -155,7 +172,7 @@ func (h *Handler) OfflineJob(c *gin.Context) {
 
 func (h *Handler) GetProfile(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	resp, err := h.logic.GetProfile(c.Request.Context(), &rpc.GetProfileRequest{Actor: actor})
+	resp, err := h.candidates.GetProfile(c.Request.Context(), &rpc.GetProfileRequest{Actor: actor})
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -170,7 +187,7 @@ func (h *Handler) UpsertProfile(c *gin.Context) {
 		return
 	}
 	req.Actor = actor
-	resp, err := h.logic.UpsertProfile(c.Request.Context(), &req)
+	resp, err := h.candidates.UpsertProfile(c.Request.Context(), &req)
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -223,7 +240,7 @@ func (h *Handler) UploadResume(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.logic.SaveResume(c.Request.Context(), &rpc.SaveResumeRequest{
+	resp, err := h.candidates.SaveResume(c.Request.Context(), &rpc.SaveResumeRequest{
 		Actor: actor, FileName: filepath.Base(fileHeader.Filename), FilePath: fullPath,
 		ContentType: contentType, Size: fileHeader.Size,
 	})
@@ -237,7 +254,7 @@ func (h *Handler) UploadResume(c *gin.Context) {
 
 func (h *Handler) DownloadResume(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	resp, err := h.logic.GetResume(c.Request.Context(), &rpc.GetResumeRequest{Actor: actor, ResumeID: pathID(c)})
+	resp, err := h.candidates.GetResume(c.Request.Context(), &rpc.GetResumeRequest{Actor: actor, ResumeID: pathID(c)})
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -251,7 +268,7 @@ func (h *Handler) DownloadResume(c *gin.Context) {
 
 func (h *Handler) ApplyJob(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	resp, err := h.logic.ApplyJob(c.Request.Context(), &rpc.ApplyJobRequest{Actor: actor, JobID: uint64(pathID(c))})
+	resp, err := h.applications.ApplyJob(c.Request.Context(), &rpc.ApplyJobRequest{Actor: actor, JobID: uint64(pathID(c))})
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -261,7 +278,7 @@ func (h *Handler) ApplyJob(c *gin.Context) {
 
 func (h *Handler) ListMyApplications(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	resp, err := h.logic.ListApplications(c.Request.Context(), &rpc.ListApplicationsRequest{
+	resp, err := h.applications.ListApplications(c.Request.Context(), &rpc.ListApplicationsRequest{
 		Actor: actor, Page: page(c), PageSize: pageSize(c),
 	})
 	if err != nil {
@@ -273,7 +290,7 @@ func (h *Handler) ListMyApplications(c *gin.Context) {
 
 func (h *Handler) ListHRApplications(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	resp, err := h.logic.ListApplications(c.Request.Context(), &rpc.ListApplicationsRequest{
+	resp, err := h.applications.ListApplications(c.Request.Context(), &rpc.ListApplicationsRequest{
 		Actor: actor, Page: page(c), PageSize: pageSize(c), JobID: uint64(queryUint(c, "job_id")),
 	})
 	if err != nil {
@@ -283,29 +300,51 @@ func (h *Handler) ListHRApplications(c *gin.Context) {
 	httputil.OK(c, resp)
 }
 
-func (h *Handler) AIChat(c *gin.Context) {
+func (h *Handler) RecommendResumes(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	var req rpc.AIChatRequest
+	var req rpc.ResumeRecommendationRequest
 	if !bind(c, &req) {
 		return
 	}
 	req.Actor = actor
-	resp, err := h.logic.AIChat(c.Request.Context(), &req)
+	resp, err := h.recommendations.CreateResumeRecommendationTask(c.Request.Context(), &req)
 	if err != nil {
 		httputil.Error(c, err)
 		return
 	}
-	httputil.OK(c, resp)
+	resp.StreamURL = fmt.Sprintf("/api/v1/hr/resume-recommendations/%s/stream", resp.TaskID)
+	httputil.Created(c, resp)
 }
 
-func (h *Handler) AIChatStream(c *gin.Context) {
+func (h *Handler) RecommendResumesStream(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
-	var req rpc.AIChatRequest
+	var req rpc.ResumeRecommendationRequest
 	if !bind(c, &req) {
 		return
 	}
 	req.Actor = actor
-	stream, err := h.logic.AIChatStream(c.Request.Context(), &req)
+	task, err := h.recommendations.CreateResumeRecommendationTask(c.Request.Context(), &req)
+	if err != nil {
+		httputil.Error(c, err)
+		return
+	}
+	h.writeRecommendationTaskSSE(c, actor, task.TaskID)
+}
+
+func (h *Handler) WatchResumeRecommendationTask(c *gin.Context) {
+	actor, _ := middleware.Actor(c)
+	h.writeRecommendationTaskSSE(c, actor, c.Param("task_id"))
+}
+
+func (h *Handler) writeRecommendationTaskSSE(c *gin.Context, actor *rpc.Actor, taskID string) {
+	if h.redis != nil {
+		h.writeRecommendationTaskSSEFromRedis(c, actor, taskID)
+		return
+	}
+	stream, err := h.recommendations.WatchResumeRecommendationTask(c.Request.Context(), &rpc.ResumeRecommendationTaskWatchRequest{
+		Actor:  actor,
+		TaskID: taskID,
+	})
 	if err != nil {
 		httputil.Error(c, err)
 		return
@@ -331,14 +370,154 @@ func (h *Handler) AIChatStream(c *gin.Context) {
 			flusher.Flush()
 			return
 		}
+		event := "progress"
 		if chunk.Done {
-			writeSSE(c.Writer, "done", chunk)
+			event = "done"
+		}
+		writeSSE(c.Writer, event, chunk)
+		flusher.Flush()
+		if chunk.Done {
+			return
+		}
+	}
+}
+
+func (h *Handler) writeRecommendationTaskSSEFromRedis(c *gin.Context, actor *rpc.Actor, taskID string) {
+	if actor == nil || actor.UserID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing actor"})
+		return
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "task_id is required"})
+		return
+	}
+	state, err := h.redis.HGetAll(c.Request.Context(), resumeRecommendationTaskKey(taskID)).Result()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	if len(state) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "recommendation task not found"})
+		return
+	}
+	if state["hr_id"] != strconv.FormatUint(actor.UserID, 10) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "cannot watch another hr's recommendation task"})
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unsupported"})
+		return
+	}
+	c.Status(http.StatusOK)
+
+	lastID, done := h.replayRecommendationTaskEvents(c, taskID, flusher)
+	if done {
+		return
+	}
+	if lastID == "" {
+		lastID = "0-0"
+	}
+	for {
+		streams, err := h.redis.XRead(c.Request.Context(), &redis.XReadArgs{
+			Streams: []string{resumeRecommendationTaskEventsKey(taskID), lastID},
+			Count:   32,
+			Block:   5 * time.Second,
+		}).Result()
+		if err != nil {
+			if err == redis.Nil {
+				continue
+			}
+			if c.Request.Context().Err() != nil {
+				return
+			}
+			writeSSE(c.Writer, "error", gin.H{"error": err.Error()})
 			flusher.Flush()
 			return
 		}
-		writeSSE(c.Writer, "delta", chunk)
-		flusher.Flush()
+		for _, stream := range streams {
+			for _, msg := range stream.Messages {
+				lastID = msg.ID
+				chunk, err := decodeRecommendationTaskEvent(msg)
+				if err != nil {
+					writeSSE(c.Writer, "error", gin.H{"error": err.Error()})
+					flusher.Flush()
+					return
+				}
+				event := "progress"
+				if chunk.Done {
+					event = "done"
+				}
+				writeSSE(c.Writer, event, chunk)
+				flusher.Flush()
+				if chunk.Done {
+					h.destroyRecommendationTaskStream(c, taskID)
+					return
+				}
+			}
+		}
 	}
+}
+
+func (h *Handler) replayRecommendationTaskEvents(c *gin.Context, taskID string, flusher http.Flusher) (string, bool) {
+	items, err := h.redis.XRange(c.Request.Context(), resumeRecommendationTaskEventsKey(taskID), "-", "+").Result()
+	if err != nil {
+		writeSSE(c.Writer, "error", gin.H{"error": err.Error()})
+		flusher.Flush()
+		return "", true
+	}
+	lastID := ""
+	for _, item := range items {
+		lastID = item.ID
+		chunk, err := decodeRecommendationTaskEvent(item)
+		if err != nil {
+			writeSSE(c.Writer, "error", gin.H{"error": err.Error()})
+			flusher.Flush()
+			return lastID, true
+		}
+		event := "progress"
+		if chunk.Done {
+			event = "done"
+		}
+		writeSSE(c.Writer, event, chunk)
+		flusher.Flush()
+		if chunk.Done {
+			h.destroyRecommendationTaskStream(c, taskID)
+			return lastID, true
+		}
+	}
+	return lastID, false
+}
+
+func (h *Handler) destroyRecommendationTaskStream(c *gin.Context, taskID string) {
+	_ = h.redis.Del(c.Request.Context(), resumeRecommendationTaskEventsKey(taskID)).Err()
+}
+
+func resumeRecommendationTaskKey(taskID string) string {
+	return "resume_recommendation:task:" + taskID
+}
+
+func resumeRecommendationTaskEventsKey(taskID string) string {
+	return resumeRecommendationTaskKey(taskID) + ":events"
+}
+
+func decodeRecommendationTaskEvent(msg redis.XMessage) (*rpc.ResumeRecommendationStreamChunk, error) {
+	payload := fmt.Sprint(msg.Values["payload"])
+	if payload == "" {
+		return nil, fmt.Errorf("empty recommendation task event payload")
+	}
+	var chunk rpc.ResumeRecommendationStreamChunk
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		return nil, err
+	}
+	return &chunk, nil
 }
 
 func writeSSE(w io.Writer, event string, payload any) {
@@ -348,18 +527,6 @@ func writeSSE(w io.Writer, event string, payload any) {
 	}
 	fmt.Fprintf(w, "event: %s\n", event)
 	fmt.Fprintf(w, "data: %s\n\n", data)
-}
-
-func (h *Handler) ListChatHistory(c *gin.Context) {
-	actor, _ := middleware.Actor(c)
-	resp, err := h.logic.ListChatHistory(c.Request.Context(), &rpc.ListChatHistoryRequest{
-		Actor: actor, Limit: int32(queryInt(c, "limit", 100)),
-	})
-	if err != nil {
-		httputil.Error(c, err)
-		return
-	}
-	httputil.OK(c, resp)
 }
 
 func validateResumeUpload(fileName string, file io.ReadSeeker) (string, error) {

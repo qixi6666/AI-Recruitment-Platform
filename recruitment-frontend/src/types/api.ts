@@ -65,23 +65,64 @@ export interface ListResponse<T> {
   total: number
 }
 
-export interface ChatMessageDTO {
-  id: number
-  hr_id: number
-  role: 'user' | 'assistant' | string
+export interface ResumeRecommendationEvidence {
+  score: number
+  semantic_score?: number
+  keyword_score?: number
+  chunk_id: number
+  resume_id: number
+  job_id: number
+  job_title: string
+  candidate_id: number
+  candidate_name: string
+  section_type: string
+  section_title: string
+  experience_index: number
+  chunk_index: number
   content: string
-  created_at: string
+  resume_name: string
 }
 
-export interface AIChatResponse {
-  answer: string
-  context: Record<string, string>
+export interface ResumeRecommendationCandidate {
+  candidate_id: number
+  candidate_name: string
+  resume_id: number
+  resume_name: string
+  job_id: number
+  job_title: string
+  score: number
+  semantic_score?: number
+  keyword_score?: number
+  reason?: string
+  risk_points?: string[]
+  evidence: ResumeRecommendationEvidence[]
 }
 
-export interface AIChatStreamChunk {
-  content?: string
-  done?: boolean
-  context?: Record<string, string>
+export interface ResumeRecommendationResponse {
+  scope: string
+  job_id?: number
+  job_title?: string
+  agent_status: string
+  fallback_reason?: string
+  candidates: ResumeRecommendationCandidate[]
+}
+
+export interface ResumeRecommendationTaskResponse {
+  task_id: string
+  status: string
+  created_at?: string
+  stream_url?: string
+  cached?: boolean
+  response?: ResumeRecommendationResponse
+}
+
+export interface ResumeRecommendationStreamChunk {
+  task_id?: string
+  status?: string
+  stage: string
+  message: string
+  done: boolean
+  response?: ResumeRecommendationResponse
 }
 
 export interface ApiEnvelope<T> {

@@ -40,7 +40,7 @@ async function submit() {
     <div>
       <p class="eyebrow">Recruitment Console</p>
       <h2>{{ title }}</h2>
-      <p class="muted">候选人可以完善档案并投递岗位，HR 可以维护岗位、查看投递并使用 AI 查询招聘数据。</p>
+      <p class="muted">候选人可以完善档案并投递岗位，HR 可以维护岗位、查看投递并使用简历推荐。</p>
     </div>
 
     <div class="segmented" aria-label="账号操作">

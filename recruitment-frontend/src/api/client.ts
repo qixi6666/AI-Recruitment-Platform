@@ -1,12 +1,11 @@
 import type {
-  AIChatResponse,
-  AIChatStreamChunk,
   ApiEnvelope,
   ApplicationDTO,
   CandidateProfileDTO,
-  ChatMessageDTO,
   JobDTO,
   ListResponse,
+  ResumeRecommendationStreamChunk,
+  ResumeRecommendationTaskResponse,
   Role,
   ResumeDTO,
   UserDTO,
@@ -134,14 +133,17 @@ export const api = {
   listHRApplications(params: { page: number; page_size: number; job_id?: number }) {
     return request<ListResponse<ApplicationDTO>>(`/hr/applications${query(params)}`)
   },
-  aiChat(question: string) {
-    return request<AIChatResponse>('/hr/ai/chat', {
+  recommendResumes(payload: {
+    job_id?: number
+    job_description?: string
+    queries?: string[]
+    limit?: number
+    evidence_limit?: number
+  }) {
+    return request<ResumeRecommendationTaskResponse>('/hr/resume-recommendations', {
       method: 'POST',
-      body: JSON.stringify({ question }),
+      body: JSON.stringify(payload),
     })
-  },
-  listChatHistory(limit = 100) {
-    return request<{ items: ChatMessageDTO[] }>(`/hr/ai/history${query({ limit })}`)
   },
 }
 
@@ -184,18 +186,55 @@ export async function downloadResume(resume: ResumeDTO) {
   URL.revokeObjectURL(url)
 }
 
-export async function streamAIChat(
-  question: string,
-  onChunk: (chunk: AIChatStreamChunk, event: string) => void,
+export async function streamResumeRecommendations(
+  payload: {
+    job_id?: number
+    job_description?: string
+    queries?: string[]
+    limit?: number
+    evidence_limit?: number
+  },
+  onChunk: (chunk: ResumeRecommendationStreamChunk, event: string) => void,
+) {
+  const task = await api.recommendResumes(payload)
+  if (task.cached && task.response) {
+    onChunk(
+      {
+        task_id: task.task_id,
+        status: task.status,
+        stage: 'done',
+        message: '命中缓存，已返回上次推荐结果',
+        done: true,
+        response: task.response,
+      },
+      'done',
+    )
+    return task
+  }
+  onChunk(
+    {
+      task_id: task.task_id,
+      status: task.status,
+      stage: 'queued',
+      message: '推荐任务已提交，等待最终推荐回答',
+      done: false,
+    },
+    'progress',
+  )
+  await streamResumeRecommendationTask(task.task_id, onChunk)
+  return task
+}
+
+export async function streamResumeRecommendationTask(
+  taskID: string,
+  onChunk: (chunk: ResumeRecommendationStreamChunk, event: string) => void,
 ) {
   const token = localStorage.getItem('recruitment_token')
-  const response = await fetch(`${API_PREFIX}/hr/ai/chat/stream`, {
-    method: 'POST',
+  const response = await fetch(`${API_PREFIX}/hr/resume-recommendations/${taskID}/stream`, {
+    method: 'GET',
     headers: {
-      'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ question }),
   })
   if (!response.ok || !response.body) {
     let message = `HTTP ${response.status}`
@@ -226,7 +265,7 @@ export async function streamAIChat(
       if (!data) {
         return
       }
-      onChunk(JSON.parse(data) as AIChatStreamChunk, event)
+      onChunk(JSON.parse(data) as ResumeRecommendationStreamChunk, event)
     })
   }
 }

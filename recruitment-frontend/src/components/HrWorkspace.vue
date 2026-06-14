@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { Archive, Edit3, Plus, RefreshCcw, Save, UsersRound } from 'lucide-vue-next'
 import { api, downloadResume, type JobPayload } from '../api/client'
-import AiAssistant from './AiAssistant.vue'
+import ResumeRecommendations from './ResumeRecommendations.vue'
 import type { ApplicationDTO, JobDTO } from '../types/api'
 
 const blankJob = (): JobPayload => ({
@@ -293,6 +293,6 @@ async function handleDownload(app: ApplicationDTO) {
       </div>
     </div>
 
-    <AiAssistant class="span-wide" />
+    <ResumeRecommendations class="span-wide" :jobs="jobs" />
   </section>
 </template>

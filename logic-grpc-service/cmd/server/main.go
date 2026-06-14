@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	healthgrpc "google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -45,14 +46,42 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", cfg.GRPCAddr, err)
 	}
+	aiClient := ai.NewClient(cfg.AI, db)
+	serverOptions := []service.Option{}
+	var recommendationQueue *service.RecommendationQueue
+	var redisClient *redis.Client
+	if cfg.RecommendationQueue.Enabled {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:     cfg.Redis.Address,
+			Password: cfg.Redis.Password,
+			DB:       cfg.Redis.DB,
+		})
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := redisClient.Ping(pingCtx).Err(); err != nil {
+			cancel()
+			log.Fatalf("connect redis %s: %v", cfg.Redis.Address, err)
+		}
+		cancel()
+		recommendationQueue = service.NewRecommendationQueue(cfg.RecommendationQueue, redisClient, aiClient)
+		if err := recommendationQueue.Start(context.Background()); err != nil {
+			log.Fatalf("start recommendation queue: %v", err)
+		}
+		defer recommendationQueue.Stop()
+		defer redisClient.Close()
+		serverOptions = append(serverOptions, service.WithRecommendationQueue(recommendationQueue))
+		log.Printf("recommendation queue enabled stream=%s workers=%d", cfg.RecommendationQueue.StreamName, cfg.RecommendationQueue.WorkerCount)
+	}
 	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(loggingUnaryInterceptor))
-	rpc.RegisterLogicServiceServer(grpcServer, service.NewServer(
+	logicServer := service.NewServer(
 		db,
-		ai.NewClient(cfg.AI, db),
-		service.WithMemoryRounds(cfg.AI.MemoryRounds),
-		service.WithMemoryTriggerTokens(cfg.AI.MemoryTriggerTokens),
-		service.WithShowToolResults(cfg.AI.ShowToolResults),
-	))
+		aiClient,
+		serverOptions...,
+	)
+	rpc.RegisterAuthServiceServer(grpcServer, logicServer)
+	rpc.RegisterJobServiceServer(grpcServer, logicServer)
+	rpc.RegisterCandidateServiceServer(grpcServer, logicServer)
+	rpc.RegisterApplicationServiceServer(grpcServer, logicServer)
+	rpc.RegisterResumeRecommendationServiceServer(grpcServer, logicServer)
 	healthServer := healthgrpc.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)

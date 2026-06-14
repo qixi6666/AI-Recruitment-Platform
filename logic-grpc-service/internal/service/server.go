@@ -2,16 +2,12 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
-	"sort"
 	"strings"
-	"time"
 
-	"github.com/cloudwego/eino/schema"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -24,46 +20,25 @@ import (
 )
 
 type Server struct {
-	db                  *gorm.DB
-	ai                  *ai.Client
-	memoryRounds        int
-	memoryTriggerTokens int
-	showToolResults     bool
+	db              *gorm.DB
+	ai              *ai.Client
+	recommendations *RecommendationQueue
 }
 
 type Option func(*Server)
 
-func WithMemoryRounds(rounds int) Option {
-	return func(s *Server) {
-		if rounds > 0 {
-			if rounds > 20 {
-				rounds = 20
-			}
-			s.memoryRounds = rounds
-		}
-	}
-}
-
-func WithShowToolResults(show bool) Option {
-	return func(s *Server) {
-		s.showToolResults = show
-	}
-}
-
-func WithMemoryTriggerTokens(tokens int) Option {
-	return func(s *Server) {
-		if tokens > 0 {
-			s.memoryTriggerTokens = tokens
-		}
-	}
-}
-
 func NewServer(db *gorm.DB, aiClient *ai.Client, opts ...Option) *Server {
-	s := &Server{db: db, ai: aiClient, memoryRounds: 5, memoryTriggerTokens: 6000}
+	s := &Server{db: db, ai: aiClient}
 	for _, opt := range opts {
 		opt(s)
 	}
 	return s
+}
+
+func WithRecommendationQueue(queue *RecommendationQueue) Option {
+	return func(s *Server) {
+		s.recommendations = queue
+	}
 }
 
 func (s *Server) Register(ctx context.Context, req *rpc.RegisterRequest) (*rpc.RegisterResponse, error) {
@@ -377,414 +352,140 @@ func (s *Server) ListApplications(ctx context.Context, req *rpc.ListApplications
 	return &rpc.ListApplicationsResponse{Items: items, Total: total}, nil
 }
 
-func (s *Server) AIChat(ctx context.Context, req *rpc.AIChatRequest) (*rpc.AIChatResponse, error) {
-	if err := requireRole(req.Actor, domain.RoleHR); err != nil {
+func (s *Server) RecommendResumes(ctx context.Context, req *rpc.ResumeRecommendationRequest) (*rpc.ResumeRecommendationResponse, error) {
+	input, err := s.validateResumeRecommendationRequest(req)
+	if err != nil {
 		return nil, err
 	}
-	question := strings.TrimSpace(req.Question)
-	if question == "" {
-		return nil, status.Error(codes.InvalidArgument, "question is required")
-	}
-	history, err := s.memoryContextMessages(ctx, req.Actor.UserID, question)
+	out, err := s.ai.RecommendResumesByJD(ctx, req.Actor.UserID, input)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	answer, err := s.ai.AnswerWithTools(ctx, req.Actor.UserID, question, history)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	now := time.Now()
-	records := chatTurnRecords(req.Actor.UserID, chatTurnID(now), question, answer.Answer, answer.ToolCalls, now)
-	if err := s.db.WithContext(ctx).Create(&records).Error; err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	return &rpc.AIChatResponse{
-		Answer:  answer.Answer,
-		Context: s.aiResponseContext(answer),
-	}, nil
+	return resumeRecommendationResponse(out), nil
 }
 
-func (s *Server) AIChatStream(req *rpc.AIChatRequest, stream rpc.LogicService_AIChatStreamServer) error {
+func (s *Server) CreateResumeRecommendationTask(ctx context.Context, req *rpc.ResumeRecommendationRequest) (*rpc.ResumeRecommendationTaskResponse, error) {
+	input, err := s.validateResumeRecommendationRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	if s.recommendations == nil {
+		return nil, status.Error(codes.FailedPrecondition, "resume recommendation queue is unavailable")
+	}
+	return s.recommendations.Enqueue(ctx, req.Actor.UserID, input)
+}
+
+func (s *Server) RecommendResumesStream(req *rpc.ResumeRecommendationRequest, stream rpc.ResumeRecommendationService_RecommendResumesStreamServer) error {
+	input, err := s.validateResumeRecommendationRequest(req)
+	if err != nil {
+		return err
+	}
+	if err := stream.Send(&rpc.ResumeRecommendationStreamChunk{
+		Stage:   "accepted",
+		Message: "已接收简历推荐请求",
+	}); err != nil {
+		return err
+	}
+	out, err := s.ai.RecommendResumesByJDWithProgress(stream.Context(), req.Actor.UserID, input, func(stage string, message string) error {
+		return stream.Send(&rpc.ResumeRecommendationStreamChunk{
+			Stage:   stage,
+			Message: message,
+		})
+	})
+	if err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	return stream.Send(&rpc.ResumeRecommendationStreamChunk{
+		Stage:    "done",
+		Message:  "简历推荐完成",
+		Done:     true,
+		Response: resumeRecommendationResponse(out),
+	})
+}
+
+func (s *Server) WatchResumeRecommendationTask(req *rpc.ResumeRecommendationTaskWatchRequest, stream rpc.ResumeRecommendationService_WatchResumeRecommendationTaskServer) error {
 	if err := requireRole(req.Actor, domain.RoleHR); err != nil {
 		return err
 	}
-	question := strings.TrimSpace(req.Question)
-	if question == "" {
-		return status.Error(codes.InvalidArgument, "question is required")
+	if s.recommendations == nil {
+		return status.Error(codes.FailedPrecondition, "resume recommendation queue is unavailable")
 	}
-	ctx := stream.Context()
-	history, err := s.memoryContextMessages(ctx, req.Actor.UserID, question)
-	if err != nil {
-		return status.Error(codes.Internal, err.Error())
-	}
-	var full strings.Builder
-	answer, err := s.ai.StreamWithTools(ctx, req.Actor.UserID, question, history, func(chunk string) error {
-		full.WriteString(chunk)
-		return stream.Send(&rpc.AIChatStreamChunk{Content: chunk})
-	})
-	if err != nil {
-		return status.Error(codes.Internal, err.Error())
-	}
-	finalAnswer := strings.TrimSpace(full.String())
-	if finalAnswer == "" {
-		return status.Error(codes.Internal, "agent returned empty answer")
-	}
-	now := time.Now()
-	records := chatTurnRecords(req.Actor.UserID, chatTurnID(now), question, finalAnswer, answer.ToolCalls, now)
-	if err := s.db.WithContext(ctx).Create(&records).Error; err != nil {
-		return status.Error(codes.Internal, err.Error())
-	}
-	return stream.Send(&rpc.AIChatStreamChunk{
-		Done:    true,
-		Context: s.aiResponseContext(answer),
-	})
+	return s.recommendations.Watch(stream.Context(), req.Actor, req.TaskID, stream.Send)
 }
 
-func (s *Server) aiResponseContext(answer ai.AgentAnswer) map[string]string {
-	context := map[string]string{
-		"agent":      "ChatModelAgent",
-		"used_tools": strings.Join(answer.UsedTools, ","),
-	}
-	if s.showToolResults {
-		context["tool_calls"] = toolCallsContext(answer.ToolCalls)
-	}
-	return context
-}
-
-func (s *Server) ListChatHistory(ctx context.Context, req *rpc.ListChatHistoryRequest) (*rpc.ListChatHistoryResponse, error) {
+func (s *Server) validateResumeRecommendationRequest(req *rpc.ResumeRecommendationRequest) (ai.ResumeRecommendationInput, error) {
 	if err := requireRole(req.Actor, domain.RoleHR); err != nil {
-		return nil, err
+		return ai.ResumeRecommendationInput{}, err
 	}
-	limit := int(req.Limit)
-	if limit <= 0 || limit > 200 {
-		limit = 100
-	}
-	q := s.db.WithContext(ctx).Where("hr_id = ? AND role <> ?", req.Actor.UserID, domain.ChatRoleTool)
-	var rows []domain.ChatMessage
-	if err := q.Order("created_at DESC").Limit(limit).Find(&rows).Error; err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].CreatedAt.Before(rows[j].CreatedAt) })
-	items := make([]*rpc.ChatMessageDTO, 0, len(rows))
-	for _, row := range rows {
-		items = append(items, &rpc.ChatMessageDTO{
-			ID: row.ID, HRID: row.HRID, TurnID: row.TurnID, Role: row.Role, ToolName: row.ToolName, Content: row.Content, CreatedAt: rpc.FormatTime(row.CreatedAt),
-		})
-	}
-	return &rpc.ListChatHistoryResponse{Items: items}, nil
-}
-
-func (s *Server) memoryContextMessages(ctx context.Context, hrID uint64, currentQuestion string) ([]*schema.Message, error) {
-	rounds := s.memoryRounds
-	if rounds <= 0 {
-		rounds = 5
-	}
-	summary, err := s.loadMemorySummary(ctx, hrID)
-	if err != nil {
-		return nil, err
-	}
-	recentTurnIDs, err := s.recentTurnIDs(ctx, hrID, rounds)
-	if err != nil {
-		return nil, err
-	}
-	pendingRows, err := s.pendingUnsummarizedRows(ctx, hrID, summary.LastSummarizedAt, recentTurnIDs)
-	if err != nil {
-		return nil, err
-	}
-	recentRows, err := s.chatRowsForTurns(ctx, hrID, recentTurnIDs, rounds)
-	if err != nil {
-		return nil, err
-	}
-
-	messages := s.buildMemoryMessages(summary.Summary, pendingRows, recentRows)
-	if len(pendingRows) > 0 && estimateMessagesTokens(messages, currentQuestion) >= s.memoryTriggerTokens {
-		newSummary, summarizeErr := s.summarizePendingRows(ctx, hrID, summary, pendingRows)
-		if summarizeErr != nil {
-			return nil, fmt.Errorf("summarize chat memory: %w", summarizeErr)
-		}
-		messages = s.buildMemoryMessages(newSummary.Summary, nil, recentRows)
-	}
-	return messages, nil
-}
-
-func (s *Server) loadMemorySummary(ctx context.Context, hrID uint64) (domain.ChatMemorySummary, error) {
-	var summary domain.ChatMemorySummary
-	err := s.db.WithContext(ctx).First(&summary, "hr_id = ?", hrID).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return domain.ChatMemorySummary{HRID: hrID}, nil
-	}
-	return summary, err
-}
-
-func (s *Server) recentTurnIDs(ctx context.Context, hrID uint64, rounds int) ([]string, error) {
-	type turnRow struct {
-		TurnID       string
-		MaxCreatedAt time.Time
-	}
-	var turns []turnRow
-	if err := s.db.WithContext(ctx).Model(&domain.ChatMessage{}).
-		Select("turn_id, MAX(created_at) AS max_created_at").
-		Where("hr_id = ? AND turn_id <> ?", hrID, "").
-		Group("turn_id").
-		Order("max_created_at DESC").
-		Limit(rounds).
-		Scan(&turns).Error; err != nil {
-		return nil, err
-	}
-	turnIDs := make([]string, 0, len(turns))
-	for _, turn := range turns {
-		turnIDs = append(turnIDs, turn.TurnID)
-	}
-	return turnIDs, nil
-}
-
-func (s *Server) pendingUnsummarizedRows(ctx context.Context, hrID uint64, after time.Time, recentTurnIDs []string) ([]domain.ChatMessage, error) {
-	q := s.db.WithContext(ctx).
-		Where("hr_id = ? AND turn_id <> ? AND created_at > ?", hrID, "", after)
-	if len(recentTurnIDs) > 0 {
-		q = q.Where("turn_id NOT IN ?", recentTurnIDs)
-	}
-	var rows []domain.ChatMessage
-	if err := q.Order("created_at ASC").Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	return rows, nil
-}
-
-func (s *Server) chatRowsForTurns(ctx context.Context, hrID uint64, turnIDs []string, fallbackRounds int) ([]domain.ChatMessage, error) {
-	var rows []domain.ChatMessage
-	if len(turnIDs) > 0 {
-		if err := s.db.WithContext(ctx).Where("hr_id = ? AND turn_id IN ?", hrID, turnIDs).
-			Order("created_at ASC").Find(&rows).Error; err != nil {
-			return nil, err
-		}
-	} else {
-		if err := s.db.WithContext(ctx).Where("hr_id = ?", hrID).Order("created_at DESC").Limit(fallbackRounds * 2).Find(&rows).Error; err != nil {
-			return nil, err
-		}
-		sort.Slice(rows, func(i, j int) bool { return rows[i].CreatedAt.Before(rows[j].CreatedAt) })
-	}
-	return rows, nil
-}
-
-func (s *Server) buildMemoryMessages(summary string, pendingRows []domain.ChatMessage, recentRows []domain.ChatMessage) []*schema.Message {
-	messages := make([]*schema.Message, 0, len(pendingRows)+len(recentRows)+1)
-	if strings.TrimSpace(summary) != "" {
-		messages = append(messages, schema.SystemMessage(memorySummaryContext(summary)))
-	}
-	messages = append(messages, s.chatRowsToMessages(pendingRows)...)
-	messages = append(messages, s.chatRowsToMessages(recentRows)...)
-	return messages
-}
-
-func (s *Server) chatRowsToMessages(rows []domain.ChatMessage) []*schema.Message {
-	messages := make([]*schema.Message, 0, len(rows))
-	for _, row := range rows {
-		switch row.Role {
-		case domain.ChatRoleUser:
-			messages = append(messages, schema.UserMessage(row.Content))
-		case domain.ChatRoleTool:
-			messages = append(messages, schema.SystemMessage(toolMemoryContent(row)))
-		case domain.ChatRoleAssistant:
-			messages = append(messages, schema.AssistantMessage(row.Content, nil))
-		}
-	}
-	return messages
-}
-
-func (s *Server) summarizePendingRows(ctx context.Context, hrID uint64, summary domain.ChatMemorySummary, rows []domain.ChatMessage) (domain.ChatMemorySummary, error) {
 	if s.ai == nil {
-		return summary, fmt.Errorf("ai client is nil")
+		return ai.ResumeRecommendationInput{}, status.Error(codes.FailedPrecondition, "resume recommendation is unavailable")
 	}
-	if len(rows) == 0 {
-		return summary, nil
+	if req.JobID == 0 && strings.TrimSpace(req.JobDescription) == "" && len(req.Queries) == 0 {
+		return ai.ResumeRecommendationInput{}, status.Error(codes.InvalidArgument, "job_id, job_description, or queries is required")
 	}
-	pendingText := rowsForSummary(rows)
-	if pendingText == "" {
-		return summary, nil
-	}
-	newText, err := s.ai.SummarizeMemory(ctx, summary.Summary, pendingText)
-	if err != nil {
-		return summary, err
-	}
-	summary.HRID = hrID
-	summary.Summary = newText
-	summary.LastSummarizedAt = rows[len(rows)-1].CreatedAt
-	summary.SummaryVersion = 1
-	if err := s.db.WithContext(ctx).Save(&summary).Error; err != nil {
-		return summary, err
-	}
-	return summary, nil
+	return ai.ResumeRecommendationInput{
+		JobID:          req.JobID,
+		JobDescription: req.JobDescription,
+		Queries:        req.Queries,
+		Limit:          int(req.Limit),
+		EvidenceLimit:  int(req.EvidenceLimit),
+	}, nil
 }
 
-func memorySummaryContext(summary string) string {
-	return fmt.Sprintf("以下是前文滚动摘要，仅用于理解用户长期意图、偏好和已确认设计；其中涉及实时招聘数据的内容不可直接作为事实使用，必须重新调用工具查询。\n\n%s", strings.TrimSpace(summary))
-}
-
-func rowsForSummary(rows []domain.ChatMessage) string {
-	var b strings.Builder
-	for _, row := range rows {
-		switch row.Role {
-		case domain.ChatRoleUser:
-			b.WriteString("用户：")
-			b.WriteString(strings.TrimSpace(row.Content))
-			b.WriteString("\n")
-		case domain.ChatRoleAssistant:
-			b.WriteString("助手：")
-			b.WriteString(strings.TrimSpace(row.Content))
-			b.WriteString("\n")
-		case domain.ChatRoleTool:
-			toolName := row.ToolName
-			if toolName == "" {
-				toolName = toolNameFromRecord(row.Content)
-			}
-			if toolName == "" {
-				toolName = "unknown"
-			}
-			b.WriteString("工具调用：")
-			b.WriteString(toolName)
-			b.WriteString("（工具参数和结果不写入长期摘要；涉及实时数据需重新查询）\n")
-		}
+func resumeRecommendationResponse(out ai.ResumeRecommendationOutput) *rpc.ResumeRecommendationResponse {
+	candidates := make([]*rpc.ResumeRecommendationCandidateDTO, 0, len(out.Candidates))
+	for _, candidate := range out.Candidates {
+		candidates = append(candidates, resumeRecommendationCandidateDTO(candidate))
 	}
-	return strings.TrimSpace(b.String())
-}
-
-func toolNameFromRecord(content string) string {
-	var record ai.ToolCallRecord
-	if err := json.Unmarshal([]byte(content), &record); err != nil {
-		return ""
-	}
-	return record.Name
-}
-
-func estimateMessagesTokens(messages []*schema.Message, currentQuestion string) int {
-	total := estimateTextTokens(currentQuestion)
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-		total += estimateTextTokens(msg.Content)
-		total += 4
-	}
-	return total
-}
-
-func estimateTextTokens(value string) int {
-	tokens := 0
-	asciiRunes := 0
-	for _, r := range value {
-		if r <= 127 {
-			asciiRunes++
-			continue
-		}
-		if asciiRunes > 0 {
-			tokens += (asciiRunes + 3) / 4
-			asciiRunes = 0
-		}
-		tokens++
-	}
-	if asciiRunes > 0 {
-		tokens += (asciiRunes + 3) / 4
-	}
-	return tokens
-}
-
-func chatTurnRecords(hrID uint64, turnID string, question string, answer string, tools []ai.ToolCallRecord, now time.Time) []domain.ChatMessage {
-	records := make([]domain.ChatMessage, 0, len(tools)+2)
-	records = append(records, domain.ChatMessage{
-		HRID:      hrID,
-		TurnID:    turnID,
-		Role:      domain.ChatRoleUser,
-		Content:   question,
-		CreatedAt: now,
-	})
-	for i, toolCall := range tools {
-		records = append(records, domain.ChatMessage{
-			HRID:      hrID,
-			TurnID:    turnID,
-			Role:      domain.ChatRoleTool,
-			ToolName:  toolCall.Name,
-			Content:   marshalToolRecord(toolCall),
-			CreatedAt: now.Add(time.Duration(i+1) * time.Millisecond),
-		})
-	}
-	records = append(records, domain.ChatMessage{
-		HRID:      hrID,
-		TurnID:    turnID,
-		Role:      domain.ChatRoleAssistant,
-		Content:   answer,
-		CreatedAt: now.Add(time.Duration(len(tools)+1) * time.Millisecond),
-	})
-	return records
-}
-
-func chatTurnID(now time.Time) string {
-	return fmt.Sprintf("%d", now.UnixNano())
-}
-
-func marshalToolRecord(record ai.ToolCallRecord) string {
-	record.Arguments = truncateForChatMemory(record.Arguments)
-	record.Result = truncateForChatMemory(record.Result)
-	data, err := json.Marshal(record)
-	if err != nil {
-		return fmt.Sprintf(`{"name":%q,"error":%q}`, record.Name, err.Error())
-	}
-	return string(data)
-}
-
-func toolCallsContext(records []ai.ToolCallRecord) string {
-	if len(records) == 0 {
-		return "[]"
-	}
-	data, err := json.Marshal(records)
-	if err != nil {
-		return "[]"
-	}
-	return string(data)
-}
-
-func toolMemoryContent(row domain.ChatMessage) string {
-	toolName := row.ToolName
-	if toolName == "" {
-		toolName = "unknown"
-	}
-	var record ai.ToolCallRecord
-	if err := json.Unmarshal([]byte(row.Content), &record); err != nil {
-		return fmt.Sprintf("历史工具调用记录：tool=%s result=%s", toolName, toolMemoryResult(toolName, row.Content, ""))
-	}
-	if record.Name != "" {
-		toolName = record.Name
-	}
-	result := toolMemoryResult(toolName, record.Result, record.Error)
-	return fmt.Sprintf("历史工具调用记录：tool=%s arguments=%s result=%s", toolName, truncateForChatMemory(record.Arguments), result)
-}
-
-func toolMemoryResult(toolName, result, recordError string) string {
-	if isRAGTool(toolName) {
-		return "[RAG 检索/推荐结果已隐藏，请根据当前问题重新检索]"
-	}
-	if recordError != "" {
-		return "error: " + recordError
-	}
-	return truncateForChatMemory(result)
-}
-
-func isRAGTool(toolName string) bool {
-	switch toolName {
-	case "semantic_search_resumes", "recommend_resumes_by_jd":
-		return true
-	default:
-		return false
+	return &rpc.ResumeRecommendationResponse{
+		Scope:          out.Scope,
+		JobID:          out.JobID,
+		JobTitle:       out.JobTitle,
+		AgentStatus:    out.AgentStatus,
+		FallbackReason: out.FallbackReason,
+		Candidates:     candidates,
 	}
 }
 
-func truncateForChatMemory(value string) string {
-	const max = 12000
-	value = strings.TrimSpace(value)
-	if len([]rune(value)) <= max {
-		return value
+func resumeRecommendationCandidateDTO(candidate ai.ResumeRecommendationCandidate) *rpc.ResumeRecommendationCandidateDTO {
+	evidence := make([]*rpc.ResumeRecommendationEvidence, 0, len(candidate.Evidence))
+	for _, item := range candidate.Evidence {
+		evidence = append(evidence, resumeRecommendationEvidenceDTO(item))
 	}
-	return string([]rune(value)[:max]) + "...[truncated]"
+	return &rpc.ResumeRecommendationCandidateDTO{
+		CandidateID:   candidate.CandidateID,
+		CandidateName: candidate.CandidateName,
+		ResumeID:      candidate.ResumeID,
+		ResumeName:    candidate.ResumeName,
+		JobID:         candidate.JobID,
+		JobTitle:      candidate.JobTitle,
+		Score:         candidate.Score,
+		SemanticScore: candidate.SemanticScore,
+		KeywordScore:  candidate.KeywordScore,
+		Reason:        candidate.Reason,
+		RiskPoints:    candidate.RiskPoints,
+		Evidence:      evidence,
+	}
+}
+
+func resumeRecommendationEvidenceDTO(item ai.ResumeSemanticSearchItem) *rpc.ResumeRecommendationEvidence {
+	return &rpc.ResumeRecommendationEvidence{
+		Score:           item.Score,
+		SemanticScore:   item.SemanticScore,
+		KeywordScore:    item.KeywordScore,
+		ChunkID:         item.ChunkID,
+		ResumeID:        item.ResumeID,
+		JobID:           item.JobID,
+		JobTitle:        item.JobTitle,
+		CandidateID:     item.CandidateID,
+		CandidateName:   item.CandidateName,
+		SectionType:     item.SectionType,
+		SectionTitle:    item.SectionTitle,
+		ExperienceIndex: item.ExperienceIndex,
+		ChunkIndex:      item.ChunkIndex,
+		Content:         item.Content,
+		ResumeName:      item.ResumeName,
+	}
 }
 
 func requireRole(actor *rpc.Actor, role string) error {

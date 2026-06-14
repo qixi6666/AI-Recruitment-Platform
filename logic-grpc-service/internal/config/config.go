@@ -11,9 +11,11 @@ import (
 )
 
 type Config struct {
-	GRPCAddr string
-	MySQL    MySQLConfig
-	AI       AIConfig
+	GRPCAddr            string
+	MySQL               MySQLConfig
+	Redis               RedisConfig
+	RecommendationQueue RecommendationQueueConfig
+	AI                  AIConfig
 }
 
 type MySQLConfig struct {
@@ -23,16 +25,29 @@ type MySQLConfig struct {
 	ConnMaxLifetimeSeconds int64
 }
 
+type RedisConfig struct {
+	Address  string
+	Password string
+	DB       int
+}
+
+type RecommendationQueueConfig struct {
+	Enabled            bool
+	StreamName         string
+	ConsumerGroup      string
+	ConsumerName       string
+	WorkerCount        int
+	TaskTTLSeconds     int64
+	TaskTimeoutSeconds int64
+}
+
 type AIConfig struct {
-	Provider            string
-	APIKey              string
-	BaseURL             string
-	Model               string
-	TimeoutSeconds      int64
-	MemoryRounds        int
-	MemoryTriggerTokens int
-	ShowToolResults     bool
-	RAG                 RAGConfig
+	Provider       string
+	APIKey         string
+	BaseURL        string
+	Model          string
+	TimeoutSeconds int64
+	RAG            RAGConfig
 }
 
 type RAGConfig struct {
@@ -66,13 +81,22 @@ func Load() (Config, error) {
 			MaxIdleConns:           10,
 			ConnMaxLifetimeSeconds: int64((30 * time.Minute).Seconds()),
 		},
+		Redis: RedisConfig{
+			Address: "127.0.0.1:6379",
+		},
+		RecommendationQueue: RecommendationQueueConfig{
+			StreamName:         "resume_recommendation:queue",
+			ConsumerGroup:      "resume_recommendation:workers",
+			ConsumerName:       "logic-1",
+			WorkerCount:        5,
+			TaskTTLSeconds:     int64((24 * time.Hour).Seconds()),
+			TaskTimeoutSeconds: int64((5 * time.Minute).Seconds()),
+		},
 		AI: AIConfig{
-			Provider:            "deepseek",
-			BaseURL:             "https://api.deepseek.com",
-			Model:               "deepseek-chat",
-			TimeoutSeconds:      int64((45 * time.Second).Seconds()),
-			MemoryRounds:        5,
-			MemoryTriggerTokens: 6000,
+			Provider:       "deepseek",
+			BaseURL:        "https://api.deepseek.com",
+			Model:          "deepseek-chat",
+			TimeoutSeconds: int64((45 * time.Second).Seconds()),
 			RAG: RAGConfig{
 				EmbeddingEndpoint:       "https://dashscope.aliyuncs.com/compatible-mode/v1",
 				EmbeddingModel:          "text-embedding-v3",
@@ -96,6 +120,16 @@ func Load() (Config, error) {
 	overrideInt(&cfg.MySQL.MaxOpenConns, "MYSQL_MAX_OPEN_CONNS")
 	overrideInt(&cfg.MySQL.MaxIdleConns, "MYSQL_MAX_IDLE_CONNS")
 	overrideInt64(&cfg.MySQL.ConnMaxLifetimeSeconds, "MYSQL_CONN_MAX_LIFETIME_SECONDS")
+	overrideString(&cfg.Redis.Address, "REDIS_ADDR")
+	overrideString(&cfg.Redis.Password, "REDIS_PASSWORD")
+	overrideInt(&cfg.Redis.DB, "REDIS_DB")
+	overrideBool(&cfg.RecommendationQueue.Enabled, "RECOMMENDATION_QUEUE_ENABLED")
+	overrideString(&cfg.RecommendationQueue.StreamName, "RECOMMENDATION_QUEUE_STREAM")
+	overrideString(&cfg.RecommendationQueue.ConsumerGroup, "RECOMMENDATION_QUEUE_GROUP")
+	overrideString(&cfg.RecommendationQueue.ConsumerName, "RECOMMENDATION_QUEUE_CONSUMER")
+	overrideInt(&cfg.RecommendationQueue.WorkerCount, "RECOMMENDATION_WORKER_COUNT")
+	overrideInt64(&cfg.RecommendationQueue.TaskTTLSeconds, "RECOMMENDATION_TASK_TTL_SECONDS")
+	overrideInt64(&cfg.RecommendationQueue.TaskTimeoutSeconds, "RECOMMENDATION_TASK_TIMEOUT_SECONDS")
 	overrideString(&cfg.AI.APIKey, "OPENAI_API_KEY")
 	overrideString(&cfg.AI.BaseURL, "OPENAI_BASE_URL")
 	overrideString(&cfg.AI.Model, "OPENAI_MODEL")
@@ -104,9 +138,6 @@ func Load() (Config, error) {
 	overrideString(&cfg.AI.BaseURL, "DEEPSEEK_BASE_URL")
 	overrideString(&cfg.AI.Model, "DEEPSEEK_MODEL")
 	overrideInt64(&cfg.AI.TimeoutSeconds, "DEEPSEEK_TIMEOUT_SECONDS")
-	overrideInt(&cfg.AI.MemoryRounds, "AI_MEMORY_ROUNDS")
-	overrideInt(&cfg.AI.MemoryTriggerTokens, "AI_MEMORY_TRIGGER_TOKENS")
-	overrideBool(&cfg.AI.ShowToolResults, "AI_SHOW_TOOL_RESULTS")
 	overrideBool(&cfg.AI.RAG.Enabled, "RAG_ENABLED")
 	overrideString(&cfg.AI.RAG.EmbeddingAPIKey, "DASHSCOPE_API_KEY")
 	overrideString(&cfg.AI.RAG.EmbeddingAPIKey, "RAG_EMBEDDING_API_KEY")
