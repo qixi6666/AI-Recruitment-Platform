@@ -36,9 +36,10 @@ type ResumeSemanticSearchItem struct {
 type ResumeRecommendationInput struct {
 	JobID          uint64   `json:"job_id" jsonschema:"description=可选，限定某个岗位；如果传入会读取该岗位 JD 作为推荐上下文"`
 	JobDescription string   `json:"job_description" jsonschema:"description=可选，岗位 JD 或 HR 对候选人的要求；job_id 为空时必须提供"`
-	Queries        []string `json:"queries" jsonschema:"description=由模型根据 JD 生成的多路检索 query，例如 Go 微服务项目经验、高并发系统优化、RAG 向量检索经验"`
-	Limit          int      `json:"limit" jsonschema:"description=返回候选人数，默认5，最大10"`
+	Queries        []string `json:"queries" jsonschema:"description=HR 本次推荐的补充要求、偏好或限制，会和 JD 一起提炼 RAG 检索计划"`
+	Limit          int      `json:"limit" jsonschema:"description=返回候选人数，默认10，最大10"`
 	EvidenceLimit  int      `json:"evidence_limit" jsonschema:"description=每个候选人返回的证据片段数，默认3，最大5"`
+	JobVersion     string   `json:"job_version,omitempty"`
 }
 
 type ResumeRecommendationOutput struct {
@@ -90,10 +91,14 @@ func (c *Client) recommendResumesByJD(ctx context.Context, hrID uint64, input Re
 	if err != nil {
 		return ResumeRecommendationOutput{}, err
 	}
+	plan := c.parseRecommendationPlan(ctx, input, jobTitle, progress)
+	if strings.TrimSpace(plan.VectorQuery) == "" && recommendationKeywordQuery(plan) == "" {
+		return ResumeRecommendationOutput{}, fmt.Errorf("recommendation query is required")
+	}
 	if err := emitRecommendationProgress(progress, "rag_searching", "正在执行 Milvus hybrid RAG 检索"); err != nil {
 		return ResumeRecommendationOutput{}, err
 	}
-	items, err := searcher.RecommendByJD(ctx, hrID, input)
+	items, err := searcher.RecommendByPlan(ctx, hrID, input, plan, recommendationRecallTopK)
 	if err != nil {
 		return ResumeRecommendationOutput{}, err
 	}
@@ -104,6 +109,7 @@ func (c *Client) recommendResumesByJD(ctx context.Context, hrID uint64, input Re
 	if err != nil {
 		return ResumeRecommendationOutput{}, err
 	}
+	items = c.rerankRecommendationEvidence(ctx, input, jobTitle, plan, items, recommendationRerankTopK, progress)
 	candidates := aggregateRecommendationCandidates(items, normalizeRecommendationLimit(input.Limit), normalizeEvidenceLimit(input.EvidenceLimit))
 	if err := emitRecommendationProgress(progress, "agent_judging", "正在由推荐 agent 基于证据判断候选人"); err != nil {
 		return ResumeRecommendationOutput{}, err
@@ -125,6 +131,52 @@ func (c *Client) recommendResumesByJD(ctx context.Context, hrID uint64, input Re
 		AgentStatus:    agentStatus,
 		FallbackReason: fallbackReason,
 		Candidates:     candidates,
+	}, nil
+}
+
+func (c *Client) recommendResumesRAGOnly(ctx context.Context, hrID uint64, input ResumeRecommendationInput, fallbackReason string) (ResumeRecommendationOutput, error) {
+	jobTitle := ""
+	if input.JobID > 0 {
+		var job domain.Job
+		if err := c.db.WithContext(ctx).First(&job, "id = ? AND hr_id = ?", input.JobID, hrID).Error; err != nil {
+			return ResumeRecommendationOutput{}, err
+		}
+		jobTitle = job.Title
+		if input.JobDescription == "" {
+			input.JobDescription = strings.Join([]string{job.Title, job.City, job.Education, job.Experience, job.Skills, job.Description}, "\n")
+		}
+	}
+	if strings.TrimSpace(input.JobDescription) == "" && len(input.Queries) == 0 {
+		return ResumeRecommendationOutput{}, fmt.Errorf("job_description or queries is required")
+	}
+	searcher, err := newResumeRAGSearcher(ctx, c.cfg.RAG)
+	if err != nil {
+		return ResumeRecommendationOutput{}, err
+	}
+	plan := fallbackRecommendationParsePlan(input)
+	if strings.TrimSpace(plan.VectorQuery) == "" && recommendationKeywordQuery(plan) == "" {
+		return ResumeRecommendationOutput{}, fmt.Errorf("recommendation query is required")
+	}
+	items, err := searcher.RecommendByPlan(ctx, hrID, input, plan, recommendationRecallTopK)
+	if err != nil {
+		return ResumeRecommendationOutput{}, err
+	}
+	items, err = c.enrichResumeSemanticItems(ctx, hrID, 0, items)
+	if err != nil {
+		return ResumeRecommendationOutput{}, err
+	}
+	items = topRecommendationEvidence(items, recommendationRerankTopK)
+	candidates := aggregateRecommendationCandidates(items, normalizeRecommendationLimit(input.Limit), normalizeEvidenceLimit(input.EvidenceLimit))
+	if fallbackReason == "" {
+		fallbackReason = "推荐任务多次重试失败，已返回 RAG 检索候选人兜底结果"
+	}
+	return ResumeRecommendationOutput{
+		Scope:          "仅基于当前 HR 岗位收到的候选人自填项目/工作经历证据推荐候选人",
+		JobID:          input.JobID,
+		JobTitle:       jobTitle,
+		AgentStatus:    recommendationAgentStatusRAGOnly,
+		FallbackReason: fallbackReason,
+		Candidates:     fallbackRecommendationCandidates(candidates),
 	}, nil
 }
 

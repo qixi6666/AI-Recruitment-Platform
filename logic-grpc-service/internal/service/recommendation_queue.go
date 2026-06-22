@@ -25,31 +25,42 @@ import (
 )
 
 const (
-	recommendationTaskStatusQueued     = "queued"
-	recommendationTaskStatusProcessing = "processing"
-	recommendationTaskStatusDone       = "done"
-	recommendationTaskStatusFailed     = "failed"
-	recommendationAgentStatusRAGOnly   = "rag_only"
-	recommendationEventStreamTTL       = 10 * time.Minute
-	recommendationResultCacheTTL       = 30 * time.Minute
-	recommendationResultCacheVersion   = "v1"
+	recommendationTaskStatusQueued      = "queued"
+	recommendationTaskStatusRunning     = "running"
+	recommendationTaskStatusSucceeded   = "succeeded"
+	recommendationTaskStatusFailed      = "failed"
+	recommendationAgentStatusRAGOnly    = "rag_only"
+	recommendationEventStreamTTL        = 10 * time.Minute
+	recommendationResultCacheTTL        = 30 * time.Minute
+	recommendationResultCacheVersion    = "v1"
+	recommendationTaskLeaseTTL          = 60 * time.Second
+	recommendationTaskHeartbeatInterval = 10 * time.Second
+	recommendationTaskMaxAttempts       = 3
 )
 
 type recommendationTaskPayload struct {
-	TaskID   string                       `json:"task_id"`
-	HRID     uint64                       `json:"hr_id"`
-	Input    ai.ResumeRecommendationInput `json:"input"`
-	CacheKey string                       `json:"cache_key"`
+	TaskID     string                       `json:"task_id"`
+	HRID       uint64                       `json:"hr_id"`
+	Input      ai.ResumeRecommendationInput `json:"input"`
+	RequestKey string                       `json:"request_key"`
+	CacheKey   string                       `json:"cache_key"`
 }
 
 type recommendationCacheInput struct {
 	Version        string   `json:"version"`
 	HRID           uint64   `json:"hr_id"`
 	JobID          uint64   `json:"job_id"`
+	JobVersion     string   `json:"job_version,omitempty"`
 	JobDescription string   `json:"job_description"`
 	Queries        []string `json:"queries"`
 	Limit          int      `json:"limit"`
 	EvidenceLimit  int      `json:"evidence_limit"`
+}
+
+type recommendationTaskLease struct {
+	acquired bool
+	terminal bool
+	status   string
 }
 
 type RecommendationQueue struct {
@@ -123,55 +134,45 @@ func (q *RecommendationQueue) Stop() {
 }
 
 func (q *RecommendationQueue) Enqueue(ctx context.Context, hrID uint64, input ai.ResumeRecommendationInput) (*rpc.ResumeRecommendationTaskResponse, error) {
+	fingerprint := q.requestFingerprint(hrID, input)
+	if fingerprint == "" {
+		return nil, status.Error(codes.Internal, "build recommendation request fingerprint")
+	}
+	requestKey := q.requestKey(fingerprint)
+	cacheKey := q.resultCacheKey(fingerprint)
+	if existingTaskID, err := q.rdb.Get(ctx, requestKey).Result(); err == nil {
+		if resp, ok, err := q.existingTaskResponse(ctx, existingTaskID, cacheKey); err != nil {
+			return nil, err
+		} else if ok {
+			return resp, nil
+		}
+		_ = q.rdb.Del(ctx, requestKey).Err()
+	} else if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, status.Errorf(codes.Unavailable, "load recommendation request key: %v", err)
+	}
+
 	taskID, err := newRecommendationTaskID()
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	now := time.Now()
-	cacheKey := q.resultCacheKey(hrID, input)
-	if cached, ok, err := q.cachedRecommendationResponse(ctx, cacheKey); err != nil {
-		log.Printf("load recommendation cache task_id=%s cache_key=%s: %v", taskID, cacheKey, err)
-	} else if ok {
-		if err := q.createCachedTask(ctx, taskID, hrID, cacheKey, now, cached); err != nil {
-			return nil, err
-		}
-		return &rpc.ResumeRecommendationTaskResponse{
-			TaskID:    taskID,
-			Status:    recommendationTaskStatusDone,
-			CreatedAt: now.Format(time.RFC3339),
-			Cached:    true,
-			Response:  cached,
-		}, nil
-	}
-	payload := recommendationTaskPayload{TaskID: taskID, HRID: hrID, Input: input, CacheKey: cacheKey}
+	payload := recommendationTaskPayload{TaskID: taskID, HRID: hrID, Input: input, RequestKey: requestKey, CacheKey: cacheKey}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	taskKey := q.taskKey(taskID)
-	pipe := q.rdb.Pipeline()
-	pipe.HSet(ctx, taskKey, map[string]any{
-		"task_id":    taskID,
-		"hr_id":      strconv.FormatUint(hrID, 10),
-		"status":     recommendationTaskStatusQueued,
-		"cache_key":  cacheKey,
-		"cache_hit":  "false",
-		"created_at": now.Format(time.RFC3339),
-		"updated_at": now.Format(time.RFC3339),
-	})
-	pipe.Expire(ctx, taskKey, q.taskTTL)
-	_, err = pipe.Exec(ctx)
+	created, existingTaskID, err := q.createTaskIfAbsent(ctx, requestKey, q.taskKey(taskID), taskID, hrID, cacheKey, now, string(data))
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "store recommendation task: %v", err)
+		return nil, err
 	}
-	if err := q.rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: q.streamName,
-		Values: map[string]any{
-			"task_id": taskID,
-			"payload": string(data),
-		},
-	}).Err(); err != nil {
-		return nil, status.Errorf(codes.Unavailable, "enqueue recommendation task: %v", err)
+	if !created {
+		if resp, ok, err := q.existingTaskResponse(ctx, existingTaskID, cacheKey); err != nil {
+			return nil, err
+		} else if ok {
+			return resp, nil
+		}
+		_ = q.rdb.Del(ctx, requestKey).Err()
+		return nil, status.Error(codes.Unavailable, "recommendation task is being initialized")
 	}
 	return &rpc.ResumeRecommendationTaskResponse{
 		TaskID:    taskID,
@@ -324,7 +325,7 @@ func (q *RecommendationQueue) reclaimStaleMessages(consumer string) {
 }
 
 func (q *RecommendationQueue) processAndAckOnSuccess(consumer string, msg redis.XMessage) {
-	if err := q.processMessage(msg); err != nil {
+	if err := q.processMessage(consumer, msg); err != nil {
 		log.Printf("recommendation task failed consumer=%s message=%s: %v; leave message pending", consumer, msg.ID, err)
 		return
 	}
@@ -333,7 +334,7 @@ func (q *RecommendationQueue) processAndAckOnSuccess(consumer string, msg redis.
 	}
 }
 
-func (q *RecommendationQueue) processMessage(msg redis.XMessage) (err error) {
+func (q *RecommendationQueue) processMessage(consumer string, msg redis.XMessage) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("panic while processing recommendation task message=%s: %v", msg.ID, recovered)
@@ -348,173 +349,420 @@ func (q *RecommendationQueue) processMessage(msg redis.XMessage) (err error) {
 		taskID = payload.TaskID
 	}
 	if payload.CacheKey == "" {
-		payload.CacheKey = q.resultCacheKey(payload.HRID, payload.Input)
+		fingerprint := q.requestFingerprint(payload.HRID, payload.Input)
+		payload.CacheKey = q.resultCacheKey(fingerprint)
 	}
-	done, err := q.taskDone(context.Background(), taskID)
+	if payload.RequestKey == "" {
+		fingerprint := q.requestFingerprint(payload.HRID, payload.Input)
+		payload.RequestKey = q.requestKey(fingerprint)
+	}
+	ownerID := consumer + ":" + msg.ID
+	lease, err := q.claimTaskLease(context.Background(), taskID, ownerID)
 	if err != nil {
 		return err
 	}
-	if done {
+	if lease.terminal {
 		return nil
 	}
-	attempt, err := q.beginTaskAttempt(context.Background(), taskID, msg.ID)
-	if err != nil {
-		return err
+	if !lease.acquired {
+		log.Printf("skip duplicate recommendation task delivery task_id=%s owner=%s status=%s", taskID, ownerID, lease.status)
+		return nil
 	}
+	heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
+	defer stopHeartbeat()
+	go q.heartbeatTaskLease(heartbeatCtx, taskID, ownerID)
+
 	ctx, cancel := context.WithTimeout(context.Background(), q.taskTimeout)
 	defer cancel()
 	if q.ai == nil {
 		err := fmt.Errorf("简历推荐服务未初始化")
-		q.failTask(ctx, taskID, msg.ID, attempt, err.Error())
-		return err
+		q.failTask(ctx, taskID, ownerID, err.Error())
+		return nil
 	}
-	out, err := q.ai.RecommendResumesByJDWithProgress(ctx, payload.HRID, payload.Input, func(stage string, message string) error {
-		if stage != "final_answer_streaming" {
-			return nil
-		}
-		active, err := q.taskAttemptActive(context.Background(), taskID, msg.ID, attempt)
-		if err != nil {
-			return err
-		}
-		if !active {
-			return fmt.Errorf("stale recommendation task attempt task_id=%s message=%s attempt=%d", taskID, msg.ID, attempt)
-		}
-		if err := q.emitChunk(context.Background(), taskID, recommendationTaskStatusProcessing, stage, message, false, nil); err != nil {
-			return fmt.Errorf("append recommendation final answer task_id=%s stage=%s: %w", taskID, stage, err)
+	out, err := q.runRecommendationWithRetries(ctx, taskID, ownerID, payload)
+	if err != nil {
+		if fallbackErr := q.completeTaskWithRAGFallback(context.Background(), taskID, ownerID, payload, err); fallbackErr != nil {
+			q.failTask(context.Background(), taskID, ownerID, fmt.Sprintf("%v；RAG 兜底也失败：%v", err, fallbackErr))
 		}
 		return nil
-	})
-	if err != nil {
-		q.failTask(context.Background(), taskID, msg.ID, attempt, err.Error())
-		return err
 	}
 	if out.AgentStatus == recommendationAgentStatusRAGOnly {
 		if err := q.rdb.Del(context.Background(), q.eventsStreamKey(taskID)).Err(); err != nil {
 			return fmt.Errorf("clear partial recommendation stream task_id=%s: %w", taskID, err)
 		}
 	}
-	active, err := q.taskAttemptActive(context.Background(), taskID, msg.ID, attempt)
+	active, err := q.taskOwnerActive(context.Background(), taskID, ownerID)
 	if err != nil {
 		return err
 	}
 	if !active {
-		return fmt.Errorf("stale recommendation task attempt task_id=%s message=%s attempt=%d", taskID, msg.ID, attempt)
+		return fmt.Errorf("stale recommendation task owner task_id=%s owner=%s", taskID, ownerID)
 	}
 	resp := resumeRecommendationResponse(out)
 	if out.AgentStatus != recommendationAgentStatusRAGOnly {
 		if err := q.storeCachedRecommendationResponse(context.Background(), payload.CacheKey, resp); err != nil {
 			log.Printf("store recommendation cache task_id=%s cache_key=%s: %v", taskID, payload.CacheKey, err)
+			_ = q.rdb.Del(context.Background(), payload.RequestKey).Err()
+		} else {
+			_ = q.rdb.Expire(context.Background(), payload.RequestKey, recommendationResultCacheTTL).Err()
 		}
+	} else {
+		_ = q.rdb.Del(context.Background(), payload.RequestKey).Err()
 	}
-	if err := q.emitChunk(context.Background(), taskID, recommendationTaskStatusDone, "done", "简历推荐完成", true, resp); err != nil {
-		return fmt.Errorf("append recommendation result task_id=%s: %w", taskID, err)
-	}
-	if err := q.completeTask(context.Background(), taskID); err != nil {
+	if err := q.completeTask(context.Background(), taskID, ownerID, resp); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (q *RecommendationQueue) failTask(ctx context.Context, taskID string, messageID string, attempt int64, reason string) {
-	active, err := q.taskAttemptActive(ctx, taskID, messageID, attempt)
-	if err != nil || !active {
-		return
+func (q *RecommendationQueue) failTask(ctx context.Context, taskID string, ownerID string, reason string) {
+	if err := q.failTaskIfOwner(ctx, taskID, ownerID, reason); err != nil {
+		log.Printf("fail recommendation task task_id=%s owner=%s: %v", taskID, ownerID, err)
 	}
-	q.markTaskStatus(ctx, taskID, recommendationTaskStatusFailed, reason)
-	_ = q.emitChunk(ctx, taskID, recommendationTaskStatusFailed, "failed", "简历推荐失败："+reason, true, nil)
 }
 
-func (q *RecommendationQueue) markTaskStatus(ctx context.Context, taskID string, taskStatus string, reason string) {
-	values := map[string]any{
-		"status":     taskStatus,
-		"updated_at": time.Now().Format(time.RFC3339),
+func (q *RecommendationQueue) runRecommendationWithRetries(ctx context.Context, taskID string, ownerID string, payload recommendationTaskPayload) (ai.ResumeRecommendationOutput, error) {
+	var lastErr error
+	for attempt := 1; attempt <= recommendationTaskMaxAttempts; attempt++ {
+		out, err := q.ai.RecommendResumesByJDWithProgress(ctx, payload.HRID, payload.Input, func(stage string, message string) error {
+			if stage != "final_answer_streaming" {
+				return nil
+			}
+			if err := q.emitChunkForOwner(context.Background(), taskID, ownerID, recommendationTaskStatusRunning, stage, message, false, nil); err != nil {
+				return fmt.Errorf("append recommendation final answer task_id=%s stage=%s: %w", taskID, stage, err)
+			}
+			return nil
+		})
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		if attempt >= recommendationTaskMaxAttempts {
+			break
+		}
+		log.Printf("retry recommendation task in worker task_id=%s attempt=%d/%d err=%v", taskID, attempt, recommendationTaskMaxAttempts, err)
+		if err := q.clearTaskEventsIfOwner(context.Background(), taskID, ownerID); err != nil {
+			return ai.ResumeRecommendationOutput{}, err
+		}
 	}
-	if reason != "" {
-		values["error"] = reason
-	}
-	if err := q.rdb.HSet(ctx, q.taskKey(taskID), values).Err(); err != nil {
-		log.Printf("mark recommendation task task_id=%s status=%s: %v", taskID, taskStatus, err)
-	}
-	_ = q.rdb.Expire(ctx, q.taskKey(taskID), q.taskTTL).Err()
+	return ai.ResumeRecommendationOutput{}, lastErr
 }
 
-func (q *RecommendationQueue) beginTaskAttempt(ctx context.Context, taskID string, messageID string) (int64, error) {
-	attempt, err := q.rdb.HIncrBy(ctx, q.taskKey(taskID), "attempt_count", 1).Result()
+func (q *RecommendationQueue) completeTaskWithRAGFallback(ctx context.Context, taskID string, ownerID string, payload recommendationTaskPayload, cause error) error {
+	active, err := q.taskOwnerActive(ctx, taskID, ownerID)
 	if err != nil {
-		return 0, fmt.Errorf("increment recommendation task attempt task_id=%s: %w", taskID, err)
+		return err
 	}
-	pipe := q.rdb.Pipeline()
-	pipe.HSet(ctx, q.taskKey(taskID), map[string]any{
-		"status":            recommendationTaskStatusProcessing,
-		"active_message_id": messageID,
-		"active_attempt":    strconv.FormatInt(attempt, 10),
-		"updated_at":        time.Now().Format(time.RFC3339),
-	})
-	pipe.HDel(ctx, q.taskKey(taskID), "error")
-	pipe.Expire(ctx, q.taskKey(taskID), q.taskTTL)
-	pipe.Del(ctx, q.eventsStreamKey(taskID))
-	if _, err := pipe.Exec(ctx); err != nil {
-		return 0, fmt.Errorf("begin recommendation task attempt task_id=%s attempt=%d: %w", taskID, attempt, err)
+	if !active {
+		return fmt.Errorf("stale recommendation task owner task_id=%s owner=%s", taskID, ownerID)
 	}
-	return attempt, nil
+	reason := fmt.Sprintf("推荐任务重试 %d 次后仍失败：%v；已返回 RAG 检索候选人兜底结果", recommendationTaskMaxAttempts, cause)
+	out, err := q.ai.RecommendResumesRAGOnly(ctx, payload.HRID, payload.Input, reason)
+	if err != nil {
+		return err
+	}
+	if err := q.rdb.Del(ctx, q.eventsStreamKey(taskID)).Err(); err != nil {
+		return fmt.Errorf("clear partial recommendation stream task_id=%s: %w", taskID, err)
+	}
+	resp := resumeRecommendationResponse(out)
+	_ = q.rdb.Del(ctx, payload.RequestKey).Err()
+	if err := q.completeTask(ctx, taskID, ownerID, resp); err != nil {
+		return err
+	}
+	return nil
 }
 
-func (q *RecommendationQueue) taskAttemptActive(ctx context.Context, taskID string, messageID string, attempt int64) (bool, error) {
-	values, err := q.rdb.HMGet(ctx, q.taskKey(taskID), "active_message_id", "active_attempt").Result()
+func (q *RecommendationQueue) claimTaskLease(ctx context.Context, taskID string, ownerID string) (recommendationTaskLease, error) {
+	now := time.Now()
+	leaseUntil := now.Add(recommendationTaskLeaseTTL)
+	const script = `
+local status = redis.call("HGET", KEYS[1], "status")
+if not status then
+	return {"missing", "0"}
+end
+if status == ARGV[5] or status == ARGV[6] then
+	return {status, "1"}
+end
+local lease_until = redis.call("HGET", KEYS[1], "lease_until")
+if lease_until and lease_until ~= "" and tonumber(lease_until) > tonumber(ARGV[1]) then
+	return {status, "0"}
+end
+redis.call("HSET", KEYS[1],
+	"status", ARGV[4],
+	"owner_id", ARGV[2],
+	"lease_until", ARGV[7],
+	"heartbeat_at", ARGV[3],
+	"updated_at", ARGV[3])
+redis.call("HDEL", KEYS[1], "error")
+redis.call("EXPIRE", KEYS[1], ARGV[8])
+redis.call("DEL", KEYS[2])
+return {ARGV[4], "2"}
+`
+	result, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.eventsStreamKey(taskID)},
+		strconv.FormatInt(now.UnixNano(), 10),
+		ownerID,
+		now.Format(time.RFC3339),
+		recommendationTaskStatusRunning,
+		recommendationTaskStatusSucceeded,
+		recommendationTaskStatusFailed,
+		strconv.FormatInt(leaseUntil.UnixNano(), 10),
+		strconv.Itoa(int(q.taskTTL.Seconds())),
+	).Result()
 	if err != nil {
-		return false, fmt.Errorf("load recommendation task active attempt task_id=%s: %w", taskID, err)
+		return recommendationTaskLease{}, fmt.Errorf("claim recommendation task lease task_id=%s owner=%s: %w", taskID, ownerID, err)
 	}
-	if len(values) != 2 {
+	values, ok := result.([]any)
+	if !ok || len(values) != 2 {
+		return recommendationTaskLease{}, fmt.Errorf("claim recommendation task lease returned invalid result task_id=%s", taskID)
+	}
+	statusValue := stringValue(values[0])
+	mode := stringValue(values[1])
+	if statusValue == "missing" {
+		return recommendationTaskLease{}, fmt.Errorf("recommendation task not found task_id=%s", taskID)
+	}
+	return recommendationTaskLease{
+		acquired: mode == "2",
+		terminal: mode == "1",
+		status:   statusValue,
+	}, nil
+}
+
+func (q *RecommendationQueue) heartbeatTaskLease(ctx context.Context, taskID string, ownerID string) {
+	ticker := time.NewTicker(recommendationTaskHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := q.refreshTaskLease(context.Background(), taskID, ownerID); err != nil {
+				log.Printf("refresh recommendation task lease task_id=%s owner=%s: %v", taskID, ownerID, err)
+			}
+		}
+	}
+}
+
+func (q *RecommendationQueue) refreshTaskLease(ctx context.Context, taskID string, ownerID string) error {
+	now := time.Now()
+	leaseUntil := now.Add(recommendationTaskLeaseTTL)
+	const script = `
+if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
+	return 0
+end
+local status = redis.call("HGET", KEYS[1], "status")
+if status ~= ARGV[4] then
+	return 0
+end
+redis.call("HSET", KEYS[1],
+	"lease_until", ARGV[2],
+	"heartbeat_at", ARGV[3],
+	"updated_at", ARGV[3])
+return 1
+`
+	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID)},
+		ownerID,
+		strconv.FormatInt(leaseUntil.UnixNano(), 10),
+		now.Format(time.RFC3339),
+		recommendationTaskStatusRunning,
+	).Int()
+	if err != nil {
+		return err
+	}
+	if ok != 1 {
+		return fmt.Errorf("task lease is no longer owned")
+	}
+	return nil
+}
+
+func (q *RecommendationQueue) taskOwnerActive(ctx context.Context, taskID string, ownerID string) (bool, error) {
+	owner, err := q.rdb.HGet(ctx, q.taskKey(taskID), "owner_id").Result()
+	if errors.Is(err, redis.Nil) {
 		return false, nil
 	}
-	return stringValue(values[0]) == messageID && stringValue(values[1]) == strconv.FormatInt(attempt, 10), nil
-}
-
-func (q *RecommendationQueue) taskDone(ctx context.Context, taskID string) (bool, error) {
-	statusValue, err := q.rdb.HGet(ctx, q.taskKey(taskID), "status").Result()
-	if errors.Is(err, redis.Nil) {
-		return false, fmt.Errorf("recommendation task not found task_id=%s", taskID)
-	}
 	if err != nil {
-		return false, fmt.Errorf("load recommendation task status task_id=%s: %w", taskID, err)
+		return false, fmt.Errorf("load recommendation task owner task_id=%s: %w", taskID, err)
 	}
-	return statusValue == recommendationTaskStatusDone, nil
+	return owner == ownerID, nil
 }
 
-func (q *RecommendationQueue) completeTask(ctx context.Context, taskID string) error {
-	pipe := q.rdb.Pipeline()
-	pipe.HSet(ctx, q.taskKey(taskID), map[string]any{
-		"status":     recommendationTaskStatusDone,
-		"updated_at": time.Now().Format(time.RFC3339),
-	})
-	pipe.HDel(ctx, q.taskKey(taskID), "active_message_id", "active_attempt", "error")
-	pipe.Expire(ctx, q.taskKey(taskID), q.taskTTL)
-	if _, err := pipe.Exec(ctx); err != nil {
+func (q *RecommendationQueue) clearTaskEventsIfOwner(ctx context.Context, taskID string, ownerID string) error {
+	const script = `
+if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
+	return 0
+end
+redis.call("DEL", KEYS[2])
+return 1
+`
+	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.eventsStreamKey(taskID)}, ownerID).Int()
+	if err != nil {
+		return err
+	}
+	if ok != 1 {
+		return fmt.Errorf("task lease is no longer owned")
+	}
+	return nil
+}
+
+func (q *RecommendationQueue) failTaskIfOwner(ctx context.Context, taskID string, ownerID string, reason string) error {
+	chunk := &rpc.ResumeRecommendationStreamChunk{
+		TaskID:  taskID,
+		Status:  recommendationTaskStatusFailed,
+		Stage:   "failed",
+		Message: "简历推荐失败：" + reason,
+		Done:    true,
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Format(time.RFC3339)
+	const script = `
+if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
+	return 0
+end
+redis.call("HSET", KEYS[1],
+	"status", ARGV[2],
+	"error", ARGV[3],
+	"updated_at", ARGV[4])
+redis.call("HDEL", KEYS[1], "owner_id", "lease_until", "heartbeat_at")
+redis.call("EXPIRE", KEYS[1], ARGV[7])
+redis.call("XADD", KEYS[2], "*", "payload", ARGV[5])
+redis.call("EXPIRE", KEYS[2], ARGV[6])
+return 1
+`
+	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.eventsStreamKey(taskID)},
+		ownerID,
+		recommendationTaskStatusFailed,
+		reason,
+		now,
+		string(data),
+		strconv.Itoa(int(recommendationEventStreamTTL.Seconds())),
+		strconv.Itoa(int(q.taskTTL.Seconds())),
+	).Int()
+	if err != nil {
+		return err
+	}
+	if ok != 1 {
+		return fmt.Errorf("task lease is no longer owned")
+	}
+	return nil
+}
+
+func (q *RecommendationQueue) completeTask(ctx context.Context, taskID string, ownerID string, resp *rpc.ResumeRecommendationResponse) error {
+	chunk := &rpc.ResumeRecommendationStreamChunk{
+		TaskID:   taskID,
+		Status:   recommendationTaskStatusSucceeded,
+		Stage:    "done",
+		Message:  "简历推荐完成",
+		Done:     true,
+		Response: resp,
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Format(time.RFC3339)
+	const script = `
+if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
+	return 0
+end
+redis.call("HSET", KEYS[1],
+	"status", ARGV[2],
+	"updated_at", ARGV[3])
+redis.call("HDEL", KEYS[1], "owner_id", "lease_until", "heartbeat_at", "error")
+redis.call("EXPIRE", KEYS[1], ARGV[4])
+redis.call("XADD", KEYS[2], "*", "payload", ARGV[5])
+redis.call("EXPIRE", KEYS[2], ARGV[6])
+return 1
+`
+	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.eventsStreamKey(taskID)},
+		ownerID,
+		recommendationTaskStatusSucceeded,
+		now,
+		strconv.Itoa(int(q.taskTTL.Seconds())),
+		string(data),
+		strconv.Itoa(int(recommendationEventStreamTTL.Seconds())),
+	).Int()
+	if err != nil {
 		return fmt.Errorf("complete recommendation task task_id=%s: %w", taskID, err)
 	}
+	if ok != 1 {
+		return fmt.Errorf("stale recommendation task owner task_id=%s owner=%s", taskID, ownerID)
+	}
 	return nil
 }
 
-func (q *RecommendationQueue) createCachedTask(ctx context.Context, taskID string, hrID uint64, cacheKey string, now time.Time, resp *rpc.ResumeRecommendationResponse) error {
-	taskKey := q.taskKey(taskID)
-	pipe := q.rdb.Pipeline()
-	pipe.HSet(ctx, taskKey, map[string]any{
-		"task_id":    taskID,
-		"hr_id":      strconv.FormatUint(hrID, 10),
-		"status":     recommendationTaskStatusDone,
-		"cache_key":  cacheKey,
-		"cache_hit":  "true",
-		"created_at": now.Format(time.RFC3339),
-		"updated_at": now.Format(time.RFC3339),
-	})
-	pipe.Expire(ctx, taskKey, q.taskTTL)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return status.Errorf(codes.Unavailable, "store cached recommendation task: %v", err)
+func (q *RecommendationQueue) createTaskIfAbsent(ctx context.Context, requestKey string, taskKey string, taskID string, hrID uint64, cacheKey string, now time.Time, payload string) (bool, string, error) {
+	const script = `
+local existing = redis.call("GET", KEYS[1])
+if existing then
+	return {0, existing}
+end
+redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+redis.call("HSET", KEYS[2],
+	"task_id", ARGV[1],
+	"hr_id", ARGV[3],
+	"status", ARGV[4],
+	"request_key", KEYS[1],
+	"cache_key", ARGV[5],
+	"created_at", ARGV[6],
+	"updated_at", ARGV[6])
+redis.call("EXPIRE", KEYS[2], ARGV[7])
+redis.call("XADD", KEYS[3], "*", "task_id", ARGV[1], "payload", ARGV[8])
+return {1, ARGV[1]}
+`
+	result, err := q.rdb.Eval(ctx, script, []string{requestKey, taskKey, q.streamName},
+		taskID,
+		strconv.Itoa(int(recommendationResultCacheTTL.Seconds())),
+		strconv.FormatUint(hrID, 10),
+		recommendationTaskStatusQueued,
+		cacheKey,
+		now.Format(time.RFC3339),
+		strconv.Itoa(int(q.taskTTL.Seconds())),
+		payload,
+	).Result()
+	if err != nil {
+		return false, "", status.Errorf(codes.Unavailable, "create recommendation task: %v", err)
 	}
-	if err := q.emitChunk(ctx, taskID, recommendationTaskStatusDone, "done", "命中缓存，已返回上次推荐结果", true, resp); err != nil {
-		return status.Errorf(codes.Unavailable, "append cached recommendation result: %v", err)
+	values, ok := result.([]any)
+	if !ok || len(values) != 2 {
+		return false, "", status.Error(codes.Unavailable, "create recommendation task returned invalid result")
 	}
-	return nil
+	return stringValue(values[0]) == "1", stringValue(values[1]), nil
+}
+
+func (q *RecommendationQueue) existingTaskResponse(ctx context.Context, taskID string, cacheKey string) (*rpc.ResumeRecommendationTaskResponse, bool, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return nil, false, nil
+	}
+	state, err := q.rdb.HGetAll(ctx, q.taskKey(taskID)).Result()
+	if err != nil {
+		return nil, false, status.Errorf(codes.Unavailable, "load recommendation task: %v", err)
+	}
+	if len(state) == 0 {
+		return nil, false, nil
+	}
+	resp := &rpc.ResumeRecommendationTaskResponse{
+		TaskID:    taskID,
+		Status:    state["status"],
+		CreatedAt: state["created_at"],
+	}
+	if resp.Status == recommendationTaskStatusFailed {
+		return nil, false, nil
+	}
+	if resp.Status == recommendationTaskStatusSucceeded {
+		cached, ok, err := q.cachedRecommendationResponse(ctx, cacheKey)
+		if err != nil {
+			return nil, false, status.Errorf(codes.Unavailable, "load recommendation cache: %v", err)
+		} else if ok {
+			resp.Cached = true
+			resp.Response = cached
+		} else {
+			return nil, false, nil
+		}
+	}
+	return resp, true, nil
 }
 
 func (q *RecommendationQueue) cachedRecommendationResponse(ctx context.Context, cacheKey string) (*rpc.ResumeRecommendationResponse, bool, error) {
@@ -546,7 +794,7 @@ func (q *RecommendationQueue) storeCachedRecommendationResponse(ctx context.Cont
 	return q.rdb.Set(ctx, cacheKey, string(data), recommendationResultCacheTTL).Err()
 }
 
-func (q *RecommendationQueue) emitChunk(ctx context.Context, taskID string, taskStatus string, stage string, message string, done bool, resp *rpc.ResumeRecommendationResponse) error {
+func (q *RecommendationQueue) emitChunkForOwner(ctx context.Context, taskID string, ownerID string, taskStatus string, stage string, message string, done bool, resp *rpc.ResumeRecommendationResponse) error {
 	chunk := &rpc.ResumeRecommendationStreamChunk{
 		TaskID:   taskID,
 		Status:   taskStatus,
@@ -559,17 +807,26 @@ func (q *RecommendationQueue) emitChunk(ctx context.Context, taskID string, task
 	if err != nil {
 		return err
 	}
-	eventsKey := q.eventsStreamKey(taskID)
-	pipe := q.rdb.Pipeline()
-	pipe.XAdd(ctx, &redis.XAddArgs{
-		Stream: eventsKey,
-		Values: map[string]any{
-			"payload": string(data),
-		},
-	})
-	pipe.Expire(ctx, eventsKey, recommendationEventStreamTTL)
-	_, err = pipe.Exec(ctx)
-	return err
+	const script = `
+if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
+	return 0
+end
+redis.call("XADD", KEYS[2], "*", "payload", ARGV[2])
+redis.call("EXPIRE", KEYS[2], ARGV[3])
+return 1
+`
+	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.eventsStreamKey(taskID)},
+		ownerID,
+		string(data),
+		strconv.Itoa(int(recommendationEventStreamTTL.Seconds())),
+	).Int()
+	if err != nil {
+		return err
+	}
+	if ok != 1 {
+		return fmt.Errorf("task lease is no longer owned")
+	}
+	return nil
 }
 
 func (q *RecommendationQueue) replayEvents(ctx context.Context, taskID string, send func(*rpc.ResumeRecommendationStreamChunk) error) (string, bool, error) {
@@ -632,11 +889,26 @@ func (q *RecommendationQueue) eventsStreamKey(taskID string) string {
 	return q.taskKey(taskID) + ":events"
 }
 
-func (q *RecommendationQueue) resultCacheKey(hrID uint64, input ai.ResumeRecommendationInput) string {
+func (q *RecommendationQueue) requestKey(fingerprint string) string {
+	if fingerprint == "" {
+		return ""
+	}
+	return "resume_recommendation:request:" + fingerprint
+}
+
+func (q *RecommendationQueue) resultCacheKey(fingerprint string) string {
+	if fingerprint == "" {
+		return ""
+	}
+	return "resume_recommendation:cache:" + fingerprint
+}
+
+func (q *RecommendationQueue) requestFingerprint(hrID uint64, input ai.ResumeRecommendationInput) string {
 	normalized := recommendationCacheInput{
 		Version:        recommendationResultCacheVersion,
 		HRID:           hrID,
 		JobID:          input.JobID,
+		JobVersion:     strings.TrimSpace(input.JobVersion),
 		JobDescription: strings.TrimSpace(input.JobDescription),
 		Queries:        normalizedRecommendationCacheQueries(input.Queries),
 		Limit:          normalizedRecommendationCacheLimit(input.Limit),
@@ -647,7 +919,7 @@ func (q *RecommendationQueue) resultCacheKey(hrID uint64, input ai.ResumeRecomme
 		return ""
 	}
 	sum := sha256.Sum256(data)
-	return "resume_recommendation:cache:" + hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:])
 }
 
 func normalizedRecommendationCacheQueries(queries []string) []string {
@@ -670,7 +942,7 @@ func normalizedRecommendationCacheQueries(queries []string) []string {
 
 func normalizedRecommendationCacheLimit(limit int) int {
 	if limit <= 0 {
-		return 5
+		return 10
 	}
 	if limit > 10 {
 		return 10
@@ -689,7 +961,7 @@ func normalizedRecommendationCacheEvidenceLimit(limit int) int {
 }
 
 func isTerminalRecommendationTaskStatus(taskStatus string) bool {
-	return taskStatus == recommendationTaskStatusDone || taskStatus == recommendationTaskStatusFailed
+	return taskStatus == recommendationTaskStatusSucceeded || taskStatus == recommendationTaskStatusFailed
 }
 
 func newRecommendationTaskID() (string, error) {

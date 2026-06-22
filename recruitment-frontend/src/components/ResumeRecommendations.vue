@@ -10,7 +10,8 @@ const props = defineProps<{
 
 const selectedJobId = ref('')
 const jobDescription = ref('')
-const limit = ref(5)
+const hrRequirements = ref('')
+const limit = ref(10)
 const evidenceLimit = ref(3)
 const loading = ref(false)
 const error = ref('')
@@ -24,19 +25,21 @@ const openJobs = computed(() => props.jobs.filter((job) => job.status === 'open'
 async function recommend() {
   const jobID = Number(selectedJobId.value)
   const jd = jobDescription.value.trim()
-  if (!jobID && !jd) {
-    error.value = '请选择岗位或粘贴 JD'
+  const requirements = hrRequirements.value.trim()
+  if (!jobID && !jd && !requirements) {
+    error.value = '请选择岗位、粘贴 JD 或填写补充要求'
     return
   }
   loading.value = true
   error.value = ''
-  progress.value = ''
+  progress.value = '思考中，正在提炼 JD 和补充要求'
   taskID.value = ''
   finalAnswerText.value = ''
   result.value = null
   const payload = {
     job_id: jobID > 0 ? jobID : undefined,
     job_description: jd || undefined,
+    queries: requirements ? [requirements] : undefined,
     limit: limit.value,
     evidence_limit: evidenceLimit.value,
   }
@@ -81,36 +84,46 @@ function percent(value: number) {
       <Sparkles :size="24" class="soft-icon" />
     </div>
 
-    <form class="recommend-form" @submit.prevent="recommend">
-      <label>
-        <span>岗位</span>
-        <select v-model="selectedJobId">
-          <option value="">不限定岗位，使用下方 JD</option>
-          <option v-for="job in openJobs" :key="job.id" :value="String(job.id)">
-            {{ job.title }} · {{ job.city }}
-          </option>
-        </select>
-      </label>
-      <label>
-        <span>推荐人数</span>
-        <input v-model.number="limit" min="1" max="10" type="number" />
-      </label>
-      <label>
-        <span>证据数</span>
-        <input v-model.number="evidenceLimit" min="1" max="5" type="number" />
-      </label>
-      <label class="span-3">
-        <span>JD / 推荐要求</span>
-        <textarea
-          v-model="jobDescription"
-          rows="5"
-          placeholder="可直接粘贴岗位 JD；如果已选择岗位，留空则使用岗位描述"
-        />
-      </label>
-      <button class="primary span-3" type="submit" :disabled="loading">
-        <Search :size="17" />
-        {{ loading ? '推荐中...' : '生成推荐' }}
-      </button>
+    <form class="recommend-form" :aria-busy="loading" @submit.prevent="recommend">
+      <fieldset class="recommend-fieldset" :disabled="loading">
+        <label>
+          <span>岗位</span>
+          <select v-model="selectedJobId">
+            <option value="">不限定岗位，使用下方 JD</option>
+            <option v-for="job in openJobs" :key="job.id" :value="String(job.id)">
+              {{ job.title }} · {{ job.city }}
+            </option>
+          </select>
+        </label>
+        <label>
+          <span>推荐人数</span>
+          <input v-model.number="limit" min="1" max="10" type="number" />
+        </label>
+        <label>
+          <span>证据数</span>
+          <input v-model.number="evidenceLimit" min="1" max="5" type="number" />
+        </label>
+        <label class="span-3">
+          <span>JD</span>
+          <textarea
+            v-model="jobDescription"
+            rows="4"
+            placeholder="可直接粘贴岗位 JD；如果已选择岗位，留空则使用岗位描述"
+          />
+        </label>
+        <label class="span-3">
+          <span>补充要求</span>
+          <textarea
+            v-model="hrRequirements"
+            rows="3"
+            placeholder="例如：优先有支付系统经验，必须熟悉 Go，最好能接受一周内到岗"
+          />
+        </label>
+        <button class="primary span-3" type="submit" :disabled="loading">
+          <Search :size="17" />
+          {{ loading ? '思考中...' : '生成推荐' }}
+        </button>
+      </fieldset>
     </form>
 
     <p v-if="error" class="inline-error">{{ error }}</p>

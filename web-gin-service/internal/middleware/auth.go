@@ -1,12 +1,18 @@
 package middleware
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/redis/go-redis/v9"
 
 	"recruitment/shared/rpc"
 )
@@ -76,6 +82,50 @@ func Actor(c *gin.Context) (*rpc.Actor, bool) {
 	}
 	actor, ok := value.(*rpc.Actor)
 	return actor, ok
+}
+
+func DuplicateSubmit(rdb *redis.Client, ttl time.Duration) gin.HandlerFunc {
+	if ttl <= 0 {
+		ttl = 3 * time.Second
+	}
+	return func(c *gin.Context) {
+		if rdb == nil || c.Request.Method != http.MethodPost {
+			c.Next()
+			return
+		}
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "read request body failed"})
+			return
+		}
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+
+		actor, _ := Actor(c)
+		actorID := uint64(0)
+		if actor != nil {
+			actorID = actor.UserID
+		}
+		route := c.FullPath()
+		if route == "" {
+			route = c.Request.URL.Path
+		}
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%s:%s:%s", actorID, c.Request.Method, route, string(body))))
+		key := "duplicate_submit:" + hex.EncodeToString(sum[:])
+		ok, err := rdb.SetNX(c.Request.Context(), key, "1", ttl).Result()
+		if err != nil {
+			c.Next()
+			return
+		}
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "duplicate submission"})
+			return
+		}
+
+		c.Next()
+		if c.Writer.Status() >= http.StatusBadRequest {
+			_ = rdb.Del(c.Request.Context(), key).Err()
+		}
+	}
 }
 
 func CORS() gin.HandlerFunc {

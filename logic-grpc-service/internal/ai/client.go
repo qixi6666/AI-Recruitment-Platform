@@ -30,3 +30,10 @@ func (c *Client) RecommendResumesByJDWithProgress(ctx context.Context, hrID uint
 	}
 	return c.recommendResumesByJD(ctx, hrID, input, progress)
 }
+
+func (c *Client) RecommendResumesRAGOnly(ctx context.Context, hrID uint64, input ResumeRecommendationInput, fallbackReason string) (ResumeRecommendationOutput, error) {
+	if !c.ragEnabled() {
+		return ResumeRecommendationOutput{}, fmt.Errorf("rag resume recommendation is disabled")
+	}
+	return c.recommendResumesRAGOnly(ctx, hrID, input, fallbackReason)
+}

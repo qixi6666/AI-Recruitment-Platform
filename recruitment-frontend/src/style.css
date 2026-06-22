@@ -518,10 +518,30 @@ label span {
 }
 
 .recommend-form {
+	display: block;
+}
+
+.recommend-fieldset {
 	display: grid;
 	grid-template-columns: minmax(220px, 1fr) 120px 120px;
 	gap: 12px;
 	align-items: end;
+	min-width: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+.recommend-fieldset:disabled {
+	cursor: wait;
+}
+
+.recommend-fieldset:disabled input,
+.recommend-fieldset:disabled select,
+.recommend-fieldset:disabled textarea {
+	color: #6f7f7a;
+	background: #f4f7f4;
+	cursor: wait;
 }
 
 .span-3 {

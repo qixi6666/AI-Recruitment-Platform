@@ -1,6 +1,6 @@
-# Testing and Benchmarking
+# 测试与基准测试
 
-## Table-Driven Tests
+## 表驱动测试
 
 ```go
 package math
@@ -35,7 +35,7 @@ func TestAdd(t *testing.T) {
 }
 ```
 
-## Subtests and Parallel Execution
+## 子测试与并行执行
 
 ```go
 func TestParallel(t *testing.T) {
@@ -50,9 +50,9 @@ func TestParallel(t *testing.T) {
     }
 
     for _, tt := range tests {
-        tt := tt // Capture range variable for parallel tests
+        tt := tt // 为并行测试捕获 range 变量
         t.Run(tt.name, func(t *testing.T) {
-            t.Parallel() // Run subtests in parallel
+            t.Parallel() // 并行运行子测试
 
             result := strings.ToUpper(tt.input)
             if result != tt.want {
@@ -63,11 +63,11 @@ func TestParallel(t *testing.T) {
 }
 ```
 
-## Test Helpers and Setup/Teardown
+## 测试辅助函数与 Setup/Teardown
 
 ```go
 func TestWithSetup(t *testing.T) {
-    // Setup
+    // 准备
     db := setupTestDB(t)
     defer cleanupTestDB(t, db)
 
@@ -89,7 +89,7 @@ func TestWithSetup(t *testing.T) {
     }
 }
 
-// Helper function (doesn't show in stack trace)
+// 辅助函数（不会显示在栈轨迹中）
 func setupTestDB(t *testing.T) *DB {
     t.Helper()
 
@@ -109,15 +109,15 @@ func cleanupTestDB(t *testing.T, db *DB) {
 }
 ```
 
-## Mocking with Interfaces
+## 使用接口进行 Mock
 
 ```go
-// Interface to mock
+// 要 mock 的接口
 type EmailSender interface {
     Send(to, subject, body string) error
 }
 
-// Mock implementation
+// Mock 实现
 type MockEmailSender struct {
     SentEmails []Email
     ShouldFail bool
@@ -135,7 +135,7 @@ func (m *MockEmailSender) Send(to, subject, body string) error {
     return nil
 }
 
-// Test using mock
+// 使用 mock 的测试
 func TestUserService_Register(t *testing.T) {
     mockSender := &MockEmailSender{}
     service := NewUserService(mockSender)
@@ -156,7 +156,7 @@ func TestUserService_Register(t *testing.T) {
 }
 ```
 
-## Benchmarking
+## 基准测试
 
 ```go
 func BenchmarkAdd(b *testing.B) {
@@ -165,7 +165,7 @@ func BenchmarkAdd(b *testing.B) {
     }
 }
 
-// Benchmark with subtests
+// 带子测试的基准测试
 func BenchmarkStringOperations(b *testing.B) {
     benchmarks := []struct {
         name  string
@@ -185,21 +185,21 @@ func BenchmarkStringOperations(b *testing.B) {
     }
 }
 
-// Benchmark with setup
+// 带 setup 的基准测试
 func BenchmarkMapOperations(b *testing.B) {
     m := make(map[string]int)
     for i := 0; i < 1000; i++ {
         m[fmt.Sprintf("key%d", i)] = i
     }
 
-    b.ResetTimer() // Don't count setup time
+    b.ResetTimer() // 不统计 setup 时间
 
     for i := 0; i < b.N; i++ {
         _ = m["key500"]
     }
 }
 
-// Parallel benchmark
+// 并行基准测试
 func BenchmarkConcurrentAccess(b *testing.B) {
     var counter int64
 
@@ -210,9 +210,9 @@ func BenchmarkConcurrentAccess(b *testing.B) {
     })
 }
 
-// Memory allocation benchmark
+// 内存分配基准测试
 func BenchmarkAllocation(b *testing.B) {
-    b.ReportAllocs() // Report allocations
+    b.ReportAllocs() // 报告分配情况
 
     for i := 0; i < b.N; i++ {
         s := make([]int, 1000)
@@ -221,11 +221,11 @@ func BenchmarkAllocation(b *testing.B) {
 }
 ```
 
-## Fuzzing (Go 1.18+)
+## 模糊测试（Go 1.18+）
 
 ```go
 func FuzzReverse(f *testing.F) {
-    // Seed corpus
+    // 种子语料
     testcases := []string{"hello", "world", "123", ""}
     for _, tc := range testcases {
         f.Add(tc)
@@ -241,7 +241,7 @@ func FuzzReverse(f *testing.F) {
     })
 }
 
-// Fuzz with multiple parameters
+// 多参数模糊测试
 func FuzzAdd(f *testing.F) {
     f.Add(1, 2)
     f.Add(0, 0)
@@ -250,7 +250,7 @@ func FuzzAdd(f *testing.F) {
     f.Fuzz(func(t *testing.T, a, b int) {
         result := Add(a, b)
 
-        // Properties that should always hold
+        // 应始终成立的性质
         if result < a && b >= 0 {
             t.Errorf("Add(%d, %d) = %d; result should be >= a when b >= 0", a, b, result)
         }
@@ -258,10 +258,10 @@ func FuzzAdd(f *testing.F) {
 }
 ```
 
-## Test Coverage
+## 测试覆盖率
 
 ```go
-// Run tests with coverage:
+// 运行带覆盖率的测试：
 // go test -cover
 // go test -coverprofile=coverage.out
 // go tool cover -html=coverage.out
@@ -288,28 +288,28 @@ func TestCalculate(t *testing.T) {
 }
 ```
 
-## Race Detector
+## 竞态检测器
 
 ```go
-// Run with: go test -race
+// 运行方式：go test -race
 
 func TestConcurrentAccess(t *testing.T) {
     var counter int
     var wg sync.WaitGroup
 
-    // This will fail with -race if not synchronized
+    // 如果没有同步，这段代码会在 -race 下失败
     for i := 0; i < 10; i++ {
         wg.Add(1)
         go func() {
             defer wg.Done()
-            counter++ // Data race!
+            counter++ // 数据竞争！
         }()
     }
 
     wg.Wait()
 }
 
-// Fixed version with mutex
+// 使用 mutex 的修复版本
 func TestConcurrentAccessSafe(t *testing.T) {
     var counter int
     var mu sync.Mutex
@@ -349,7 +349,7 @@ func TestRenderHTML(t *testing.T) {
     goldenFile := filepath.Join("testdata", "expected.html")
 
     if *update {
-        // Update golden file: go test -update
+        // 更新 golden file：go test -update
         os.WriteFile(goldenFile, []byte(result), 0644)
     }
 
@@ -366,7 +366,7 @@ func TestRenderHTML(t *testing.T) {
 var update = flag.Bool("update", false, "update golden files")
 ```
 
-## Integration Tests
+## 集成测试
 
 ```go
 // integration_test.go
@@ -384,11 +384,11 @@ func TestIntegration(t *testing.T) {
         t.Skip("skipping integration test in short mode")
     }
 
-    // Long-running integration test
+    // 长时间运行的集成测试
     server := startTestServer(t)
     defer server.Stop()
 
-    time.Sleep(100 * time.Millisecond) // Wait for server
+    time.Sleep(100 * time.Millisecond) // 等待 server
 
     client := NewClient(server.URL)
     resp, err := client.Get("/health")
@@ -401,14 +401,14 @@ func TestIntegration(t *testing.T) {
     }
 }
 
-// Run: go test -tags=integration
-// Run short tests only: go test -short
+// 运行：go test -tags=integration
+// 仅运行短测试：go test -short
 ```
 
-## Testable Examples
+## 可测试示例
 
 ```go
-// Example tests that appear in godoc
+// 出现在 godoc 中的示例测试
 func ExampleAdd() {
     result := Add(2, 3)
     fmt.Println(result)
@@ -421,7 +421,7 @@ func ExampleAdd_negative() {
     // Output: -5
 }
 
-// Unordered output
+// 无序输出
 func ExampleKeys() {
     m := map[string]int{"a": 1, "b": 2, "c": 3}
     keys := Keys(m)
@@ -435,17 +435,17 @@ func ExampleKeys() {
 }
 ```
 
-## Quick Reference
+## 快速参考
 
-| Command | Description |
-|---------|-------------|
-| `go test` | Run tests |
-| `go test -v` | Verbose output |
-| `go test -run TestName` | Run specific test |
-| `go test -bench .` | Run benchmarks |
-| `go test -cover` | Show coverage |
-| `go test -race` | Run race detector |
-| `go test -short` | Skip long tests |
-| `go test -fuzz FuzzName` | Run fuzzing |
-| `go test -cpuprofile cpu.prof` | CPU profiling |
-| `go test -memprofile mem.prof` | Memory profiling |
+| 命令 | 说明 |
+|------|------|
+| `go test` | 运行测试 |
+| `go test -v` | 详细输出 |
+| `go test -run TestName` | 运行指定测试 |
+| `go test -bench .` | 运行基准测试 |
+| `go test -cover` | 显示覆盖率 |
+| `go test -race` | 运行竞态检测器 |
+| `go test -short` | 跳过长测试 |
+| `go test -fuzz FuzzName` | 运行模糊测试 |
+| `go test -cpuprofile cpu.prof` | CPU 性能分析 |
+| `go test -memprofile mem.prof` | 内存性能分析 |

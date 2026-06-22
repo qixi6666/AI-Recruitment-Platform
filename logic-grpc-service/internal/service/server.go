@@ -7,6 +7,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
@@ -353,7 +354,7 @@ func (s *Server) ListApplications(ctx context.Context, req *rpc.ListApplications
 }
 
 func (s *Server) RecommendResumes(ctx context.Context, req *rpc.ResumeRecommendationRequest) (*rpc.ResumeRecommendationResponse, error) {
-	input, err := s.validateResumeRecommendationRequest(req)
+	input, err := s.validateResumeRecommendationRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -365,7 +366,7 @@ func (s *Server) RecommendResumes(ctx context.Context, req *rpc.ResumeRecommenda
 }
 
 func (s *Server) CreateResumeRecommendationTask(ctx context.Context, req *rpc.ResumeRecommendationRequest) (*rpc.ResumeRecommendationTaskResponse, error) {
-	input, err := s.validateResumeRecommendationRequest(req)
+	input, err := s.validateResumeRecommendationRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +377,7 @@ func (s *Server) CreateResumeRecommendationTask(ctx context.Context, req *rpc.Re
 }
 
 func (s *Server) RecommendResumesStream(req *rpc.ResumeRecommendationRequest, stream rpc.ResumeRecommendationService_RecommendResumesStreamServer) error {
-	input, err := s.validateResumeRecommendationRequest(req)
+	input, err := s.validateResumeRecommendationRequest(stream.Context(), req)
 	if err != nil {
 		return err
 	}
@@ -413,7 +414,7 @@ func (s *Server) WatchResumeRecommendationTask(req *rpc.ResumeRecommendationTask
 	return s.recommendations.Watch(stream.Context(), req.Actor, req.TaskID, stream.Send)
 }
 
-func (s *Server) validateResumeRecommendationRequest(req *rpc.ResumeRecommendationRequest) (ai.ResumeRecommendationInput, error) {
+func (s *Server) validateResumeRecommendationRequest(ctx context.Context, req *rpc.ResumeRecommendationRequest) (ai.ResumeRecommendationInput, error) {
 	if err := requireRole(req.Actor, domain.RoleHR); err != nil {
 		return ai.ResumeRecommendationInput{}, err
 	}
@@ -423,13 +424,27 @@ func (s *Server) validateResumeRecommendationRequest(req *rpc.ResumeRecommendati
 	if req.JobID == 0 && strings.TrimSpace(req.JobDescription) == "" && len(req.Queries) == 0 {
 		return ai.ResumeRecommendationInput{}, status.Error(codes.InvalidArgument, "job_id, job_description, or queries is required")
 	}
-	return ai.ResumeRecommendationInput{
+	input := ai.ResumeRecommendationInput{
 		JobID:          req.JobID,
 		JobDescription: req.JobDescription,
 		Queries:        req.Queries,
 		Limit:          int(req.Limit),
 		EvidenceLimit:  int(req.EvidenceLimit),
-	}, nil
+	}
+	if req.JobID > 0 {
+		var job domain.Job
+		err := s.db.WithContext(ctx).
+			Select("id", "updated_at").
+			First(&job, "id = ? AND hr_id = ?", req.JobID, req.Actor.UserID).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ai.ResumeRecommendationInput{}, status.Error(codes.NotFound, "job not found")
+		}
+		if err != nil {
+			return ai.ResumeRecommendationInput{}, status.Error(codes.Internal, err.Error())
+		}
+		input.JobVersion = job.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return input, nil
 }
 
 func resumeRecommendationResponse(out ai.ResumeRecommendationOutput) *rpc.ResumeRecommendationResponse {

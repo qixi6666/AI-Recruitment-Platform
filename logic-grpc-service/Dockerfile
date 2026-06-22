@@ -1,5 +1,11 @@
 FROM golang:1.25-bookworm AS builder
 
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=sum.golang.google.cn
+
+ENV GOPROXY=${GOPROXY} \
+    GOSUMDB=${GOSUMDB}
+
 WORKDIR /src
 
 COPY go.work go.work.sum ./
@@ -8,7 +14,11 @@ COPY logic-grpc-service/go.mod logic-grpc-service/go.sum ./logic-grpc-service/
 COPY web-gin-service/go.mod web-gin-service/go.sum ./web-gin-service/
 
 WORKDIR /src/logic-grpc-service
-RUN go mod download
+RUN for attempt in 1 2 3; do \
+      go mod download && break; \
+      if [ "$attempt" = "3" ]; then exit 1; fi; \
+      sleep 5; \
+    done
 
 WORKDIR /src
 COPY shared ./shared

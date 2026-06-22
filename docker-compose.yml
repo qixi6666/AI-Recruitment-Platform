@@ -97,6 +97,9 @@ services:
     build:
       context: .
       dockerfile: logic-grpc-service/Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        GOSUMDB: ${GOSUMDB:-sum.golang.google.cn}
     environment:
       LOGIC_GRPC_ADDR: ":9002"
       MYSQL_DSN: "root:${MYSQL_ROOT_PASSWORD:-password}@tcp(mysql:3306)/${MYSQL_DATABASE:-recruitment}?charset=utf8mb4&parseTime=True&loc=Local"
@@ -132,7 +135,7 @@ services:
       MILVUS_SPARSE_VECTOR_FIELD: ${MILVUS_SPARSE_VECTOR_FIELD:-sparse_vector}
       MILVUS_TEXT_FIELD: ${MILVUS_TEXT_FIELD:-search_text}
       MILVUS_METRIC_TYPE: ${MILVUS_METRIC_TYPE:-COSINE}
-      MILVUS_OUTPUT_FIELDS: ${RAG_MILVUS_OUTPUT_FIELDS:-chunk_id,hr_id,job_id,created_at}
+      MILVUS_OUTPUT_FIELDS: ${RAG_MILVUS_OUTPUT_FIELDS:-chunk_id,hr_id,job_id,application_id,resume_id,candidate_id,education_degree,education_rank,experience_months,created_at}
       RAG_TOP_K: ${RAG_TOP_K:-8}
     ports:
       - "9002:9002"
@@ -150,6 +153,9 @@ services:
     build:
       context: .
       dockerfile: web-gin-service/Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        GOSUMDB: ${GOSUMDB:-sum.golang.google.cn}
     environment:
       WEB_HTTP_ADDR: ":8080"
       LOGIC_GRPC_ADDR: logic:9002

@@ -1,11 +1,11 @@
-# Generics and Type Parameters
+# 泛型与类型参数
 
-## Basic Type Parameters
+## 基础类型参数
 
 ```go
 package main
 
-// Generic function with type parameter
+// 带类型参数的泛型函数
 func Max[T constraints.Ordered](a, b T) T {
     if a > b {
         return a
@@ -13,7 +13,7 @@ func Max[T constraints.Ordered](a, b T) T {
     return b
 }
 
-// Multiple type parameters
+// 多个类型参数
 func Map[T, U any](slice []T, fn func(T) U) []U {
     result := make([]U, len(slice))
     for i, v := range slice {
@@ -22,7 +22,7 @@ func Map[T, U any](slice []T, fn func(T) U) []U {
     return result
 }
 
-// Usage
+// 用法
 func main() {
     maxInt := Max(10, 20)           // T = int
     maxFloat := Max(3.14, 2.71)     // T = float64
@@ -34,12 +34,12 @@ func main() {
 }
 ```
 
-## Type Constraints
+## 类型约束
 
 ```go
 import "constraints"
 
-// Built-in constraints
+// 内置约束
 type Number interface {
     constraints.Integer | constraints.Float
 }
@@ -52,7 +52,7 @@ func Sum[T Number](numbers []T) T {
     return total
 }
 
-// Custom constraints with methods
+// 带方法的自定义约束
 type Stringer interface {
     String() string
 }
@@ -63,7 +63,7 @@ func PrintAll[T Stringer](items []T) {
     }
 }
 
-// Approximate constraint using ~
+// 使用 ~ 的近似约束
 type Integer interface {
     ~int | ~int8 | ~int16 | ~int32 | ~int64
 }
@@ -74,17 +74,17 @@ func Double[T Integer](n T) T {
     return n * 2
 }
 
-// Works with both int and MyInt
+// 同时适用于 int 和 MyInt
 func main() {
     fmt.Println(Double(5))          // int
     fmt.Println(Double(MyInt(5)))   // MyInt
 }
 ```
 
-## Generic Data Structures
+## 泛型数据结构
 
 ```go
-// Generic Stack
+// 泛型 Stack
 type Stack[T any] struct {
     items []T
 }
@@ -113,7 +113,7 @@ func (s *Stack[T]) IsEmpty() bool {
     return len(s.items) == 0
 }
 
-// Usage
+// 用法
 intStack := NewStack[int]()
 intStack.Push(1)
 intStack.Push(2)
@@ -123,10 +123,10 @@ stringStack.Push("hello")
 stringStack.Push("world")
 ```
 
-## Generic Map Operations
+## 泛型 map 操作
 
 ```go
-// Filter with generics
+// 使用泛型进行过滤
 func Filter[T any](slice []T, predicate func(T) bool) []T {
     result := make([]T, 0, len(slice))
     for _, v := range slice {
@@ -146,7 +146,7 @@ func Reduce[T, U any](slice []T, initial U, fn func(U, T) U) U {
     return acc
 }
 
-// Keys from map
+// 从 map 获取 key
 func Keys[K comparable, V any](m map[K]V) []K {
     keys := make([]K, 0, len(m))
     for k := range m {
@@ -155,7 +155,7 @@ func Keys[K comparable, V any](m map[K]V) []K {
     return keys
 }
 
-// Values from map
+// 从 map 获取 value
 func Values[K comparable, V any](m map[K]V) []V {
     values := make([]V, 0, len(m))
     for _, v := range m {
@@ -164,7 +164,7 @@ func Values[K comparable, V any](m map[K]V) []V {
     return values
 }
 
-// Usage
+// 用法
 numbers := []int{1, 2, 3, 4, 5, 6}
 evens := Filter(numbers, func(n int) bool { return n%2 == 0 })
 
@@ -175,10 +175,10 @@ keys := Keys(m)     // []string{"a", "b"}
 values := Values(m) // []int{1, 2}
 ```
 
-## Generic Pairs and Tuples
+## 泛型 Pair 和 Tuple
 
 ```go
-// Generic Pair
+// 泛型 Pair
 type Pair[T, U any] struct {
     First  T
     Second U
@@ -192,11 +192,11 @@ func (p Pair[T, U]) Swap() Pair[U, T] {
     return Pair[U, T]{First: p.Second, Second: p.First}
 }
 
-// Usage
+// 用法
 pair := NewPair("name", 42)
 swapped := pair.Swap() // Pair[int, string]
 
-// Generic Result type (like Rust's Result<T, E>)
+// 泛型 Result 类型（类似 Rust 的 Result<T, E>）
 type Result[T any] struct {
     value T
     err   error
@@ -226,10 +226,10 @@ func (r Result[T]) UnwrapOr(defaultValue T) T {
 }
 ```
 
-## Comparable Constraint
+## Comparable 约束
 
 ```go
-// Find using comparable
+// 使用 comparable 查找
 func Find[T comparable](slice []T, target T) (int, bool) {
     for i, v := range slice {
         if v == target {
@@ -245,7 +245,7 @@ func Contains[T comparable](slice []T, target T) bool {
     return found
 }
 
-// Unique elements
+// 唯一元素
 func Unique[T comparable](slice []T) []T {
     seen := make(map[T]struct{})
     result := make([]T, 0, len(slice))
@@ -260,24 +260,24 @@ func Unique[T comparable](slice []T) []T {
     return result
 }
 
-// Usage
+// 用法
 nums := []int{1, 2, 2, 3, 3, 4}
 unique := Unique(nums) // []int{1, 2, 3, 4}
 
 idx, found := Find([]string{"a", "b", "c"}, "b") // 1, true
 ```
 
-## Generic Interfaces
+## 泛型接口
 
 ```go
-// Generic interface
+// 泛型接口
 type Container[T any] interface {
     Add(item T)
     Remove() (T, bool)
     Size() int
 }
 
-// Implementation
+// 实现
 type Queue[T any] struct {
     items []T
 }
@@ -300,26 +300,26 @@ func (q *Queue[T]) Size() int {
     return len(q.items)
 }
 
-// Function accepting generic interface
+// 接收泛型接口的函数
 func ProcessContainer[T any](c Container[T], item T) {
     c.Add(item)
     fmt.Printf("Container size: %d\n", c.Size())
 }
 ```
 
-## Type Inference
+## 类型推断
 
 ```go
-// Type inference works in most cases
+// 类型推断在多数情况下都能工作
 func Identity[T any](x T) T {
     return x
 }
 
-// No need to specify type
-result := Identity(42)          // T inferred as int
-str := Identity("hello")        // T inferred as string
+// 不需要指定类型
+result := Identity(42)          // T 被推断为 int
+str := Identity("hello")        // T 被推断为 string
 
-// Type inference with constraints
+// 带约束的类型推断
 func Min[T constraints.Ordered](a, b T) T {
     if a < b {
         return a
@@ -327,20 +327,20 @@ func Min[T constraints.Ordered](a, b T) T {
     return b
 }
 
-// Inferred from arguments
+// 从参数推断
 minVal := Min(10, 20)           // T = int
 minFloat := Min(1.5, 2.5)       // T = float64
 
-// Explicit type when needed
+// 需要时显式指定类型
 result := Map[int, string]([]int{1, 2}, func(n int) string {
     return fmt.Sprintf("%d", n)
 })
 ```
 
-## Generic Channels
+## 泛型 Channel
 
 ```go
-// Generic channel operations
+// 泛型 channel 操作
 func Merge[T any](channels ...<-chan T) <-chan T {
     out := make(chan T)
     var wg sync.WaitGroup
@@ -363,7 +363,7 @@ func Merge[T any](channels ...<-chan T) <-chan T {
     return out
 }
 
-// Generic pipeline stage
+// 泛型 pipeline 阶段
 func Stage[T, U any](in <-chan T, fn func(T) U) <-chan U {
     out := make(chan U)
     go func() {
@@ -375,7 +375,7 @@ func Stage[T, U any](in <-chan T, fn func(T) U) <-chan U {
     return out
 }
 
-// Usage
+// 用法
 ch1 := make(chan int)
 ch2 := make(chan int)
 
@@ -386,10 +386,10 @@ doubled := Stage(numbers, func(n int) int { return n * 2 })
 strings := Stage(doubled, func(n int) string { return fmt.Sprintf("%d", n) })
 ```
 
-## Union Constraints
+## 联合约束
 
 ```go
-// Union of types
+// 类型联合
 type StringOrInt interface {
     string | int
 }
@@ -398,7 +398,7 @@ func Process[T StringOrInt](val T) string {
     return fmt.Sprintf("%v", val)
 }
 
-// More complex unions
+// 更复杂的联合
 type Numeric interface {
     int | int8 | int16 | int32 | int64 |
     uint | uint8 | uint16 | uint32 | uint64 |
@@ -412,7 +412,7 @@ func Abs[T Numeric](n T) T {
     return n
 }
 
-// Union with methods
+// 带方法的联合
 type Serializable interface {
     string | []byte
 }
@@ -429,14 +429,14 @@ func Serialize[T Serializable](data T) []byte {
 }
 ```
 
-## Quick Reference
+## 快速参考
 
-| Feature | Syntax | Use Case |
-|---------|--------|----------|
-| Basic generic | `func F[T any]()` | Any type |
-| Constraint | `func F[T Constraint]()` | Restricted types |
-| Multiple params | `func F[T, U any]()` | Multiple type variables |
-| Comparable | `func F[T comparable]()` | Types supporting == and != |
-| Ordered | `func F[T constraints.Ordered]()` | Types supporting <, >, <=, >= |
-| Union | `T interface{int \| string}` | Either type |
-| Approximate | `~int` | Include type aliases |
+| 特性 | 语法 | 使用场景 |
+|------|------|----------|
+| 基础泛型 | `func F[T any]()` | 任意类型 |
+| 约束 | `func F[T Constraint]()` | 受限类型 |
+| 多个参数 | `func F[T, U any]()` | 多个类型变量 |
+| Comparable | `func F[T comparable]()` | 支持 == 和 != 的类型 |
+| Ordered | `func F[T constraints.Ordered]()` | 支持 <、>、<=、>= 的类型 |
+| 联合 | `T interface{int \| string}` | 二选一类型 |
+| 近似约束 | `~int` | 包含类型别名 |

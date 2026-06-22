@@ -3,7 +3,9 @@ package ai
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,8 @@ const (
 	resumeChunkSize                 = 900
 	resumeMaxChunks                 = 80
 	embeddingBatchSize              = 16
+	recommendationRecallTopK        = 100
+	recommendationRerankTopK        = 20
 	recommendationSemanticWeight    = 0.65
 	recommendationKeywordWeight     = 0.35
 	recommendationTopEvidenceWeight = 0.70
@@ -38,10 +42,16 @@ type resumeRAGSearcher struct {
 }
 
 type resumeChunkRow struct {
-	ChunkID   int64 `milvus:"name:chunk_id"`
-	HRID      int64 `milvus:"name:hr_id"`
-	JobID     int64 `milvus:"name:job_id"`
-	CreatedAt int64 `milvus:"name:created_at"`
+	ChunkID          int64  `milvus:"name:chunk_id"`
+	HRID             int64  `milvus:"name:hr_id"`
+	JobID            int64  `milvus:"name:job_id"`
+	ApplicationID    int64  `milvus:"name:application_id"`
+	ResumeID         int64  `milvus:"name:resume_id"`
+	CandidateID      int64  `milvus:"name:candidate_id"`
+	EducationDegree  string `milvus:"name:education_degree"`
+	EducationRank    int64  `milvus:"name:education_rank"`
+	ExperienceMonths int64  `milvus:"name:experience_months"`
+	CreatedAt        int64  `milvus:"name:created_at"`
 }
 
 type resumeExperienceChunk struct {
@@ -110,20 +120,26 @@ func (c *Client) IndexApplicationResume(ctx context.Context, hrID, jobID, applic
 
 	count := len(chunks)
 	rows := make([]domain.ResumeExperienceChunk, count)
+	educationDegree := normalizeEducationDegree(profile.Education)
+	educationRank := educationRankFromDegree(educationDegree)
+	experienceMonths := estimateProfileExperienceMonths(profile)
 	for i, chunk := range chunks {
 		rows[i] = domain.ResumeExperienceChunk{
-			HRID:            hrID,
-			JobID:           jobID,
-			ApplicationID:   applicationID,
-			ResumeID:        resume.ID,
-			CandidateID:     candidateID,
-			SectionType:     chunk.SectionType,
-			SectionTitle:    chunk.SectionTitle,
-			ExperienceIndex: chunk.ExperienceIndex,
-			ChunkIndex:      chunk.ChunkIndex,
-			KeywordText:     chunk.SearchText,
-			EvidenceText:    chunk.Content,
-			OriginalText:    chunk.Content,
+			HRID:             hrID,
+			JobID:            jobID,
+			ApplicationID:    applicationID,
+			ResumeID:         resume.ID,
+			CandidateID:      candidateID,
+			EducationDegree:  educationDegree,
+			EducationRank:    educationRank,
+			ExperienceMonths: experienceMonths,
+			SectionType:      chunk.SectionType,
+			SectionTitle:     chunk.SectionTitle,
+			ExperienceIndex:  chunk.ExperienceIndex,
+			ChunkIndex:       chunk.ChunkIndex,
+			KeywordText:      chunk.SearchText,
+			EvidenceText:     chunk.Content,
+			OriginalText:     chunk.Content,
 		}
 	}
 	if err := c.db.WithContext(ctx).Create(&rows).Error; err != nil {
@@ -133,6 +149,12 @@ func (c *Client) IndexApplicationResume(ctx context.Context, hrID, jobID, applic
 	chunkIDs := make([]int64, count)
 	hrIDs := make([]int64, count)
 	jobIDs := make([]int64, count)
+	applicationIDs := make([]int64, count)
+	resumeIDs := make([]int64, count)
+	candidateIDs := make([]int64, count)
+	educationDegrees := make([]string, count)
+	educationRanks := make([]int64, count)
+	experienceMonthsValues := make([]int64, count)
 	searchTexts := make([]string, count)
 	createdAt := make([]int64, count)
 	now := time.Now().Unix()
@@ -140,6 +162,12 @@ func (c *Client) IndexApplicationResume(ctx context.Context, hrID, jobID, applic
 		chunkIDs[i] = int64(rows[i].ID)
 		hrIDs[i] = int64(hrID)
 		jobIDs[i] = int64(jobID)
+		applicationIDs[i] = int64(applicationID)
+		resumeIDs[i] = int64(resume.ID)
+		candidateIDs[i] = int64(candidateID)
+		educationDegrees[i] = educationDegree
+		educationRanks[i] = int64(educationRank)
+		experienceMonthsValues[i] = int64(experienceMonths)
 		searchTexts[i] = chunk.SearchText
 		createdAt[i] = now
 	}
@@ -149,6 +177,12 @@ func (c *Client) IndexApplicationResume(ctx context.Context, hrID, jobID, applic
 			WithInt64Column("chunk_id", chunkIDs).
 			WithInt64Column("hr_id", hrIDs).
 			WithInt64Column("job_id", jobIDs).
+			WithInt64Column("application_id", applicationIDs).
+			WithInt64Column("resume_id", resumeIDs).
+			WithInt64Column("candidate_id", candidateIDs).
+			WithVarcharColumn("education_degree", educationDegrees).
+			WithInt64Column("education_rank", educationRanks).
+			WithInt64Column("experience_months", experienceMonthsValues).
 			WithVarcharColumn(searcher.cfg.MilvusTextField, searchTexts).
 			WithInt64Column("created_at", createdAt).
 			WithFloatVectorColumn(searcher.cfg.MilvusVectorField, dim, embeddings),
@@ -198,7 +232,7 @@ func (s *resumeRAGSearcher) ensureResumeCollection(ctx context.Context, client *
 		return fmt.Errorf("check milvus collection: %w", err)
 	}
 	if exists {
-		return nil
+		return s.validateResumeCollectionSchema(ctx, client)
 	}
 	if err := s.createResumeCollection(ctx, client); err != nil {
 		return err
@@ -212,6 +246,42 @@ func (s *resumeRAGSearcher) ensureResumeCollection(ctx context.Context, client *
 	}
 	if err := loadTask.Await(ctx); err != nil {
 		return fmt.Errorf("await milvus collection load: %w", err)
+	}
+	return nil
+}
+
+func (s *resumeRAGSearcher) validateResumeCollectionSchema(ctx context.Context, client *milvus.Client) error {
+	collection, err := client.DescribeCollection(ctx, milvus.NewDescribeCollectionOption(s.cfg.MilvusCollection))
+	if err != nil {
+		return fmt.Errorf("describe milvus collection: %w", err)
+	}
+	required := []string{
+		"chunk_id",
+		"hr_id",
+		"job_id",
+		"application_id",
+		"resume_id",
+		"candidate_id",
+		"education_degree",
+		"education_rank",
+		"experience_months",
+		s.cfg.MilvusTextField,
+		s.cfg.MilvusVectorField,
+		s.cfg.MilvusSparseVectorField,
+		"created_at",
+	}
+	existing := make(map[string]struct{}, len(collection.Schema.Fields))
+	for _, field := range collection.Schema.Fields {
+		existing[field.Name] = struct{}{}
+	}
+	var missing []string
+	for _, name := range required {
+		if _, ok := existing[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("milvus collection %q missing metadata fields %s; recreate the collection and reindex resumes", s.cfg.MilvusCollection, strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -230,6 +300,12 @@ func (s *resumeRAGSearcher) createResumeCollection(ctx context.Context, client *
 		WithField(entity.NewField().WithName("chunk_id").WithDataType(entity.FieldTypeInt64)).
 		WithField(entity.NewField().WithName("hr_id").WithDataType(entity.FieldTypeInt64)).
 		WithField(entity.NewField().WithName("job_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("application_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("resume_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("candidate_id").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("education_degree").WithDataType(entity.FieldTypeVarChar).WithMaxLength(64)).
+		WithField(entity.NewField().WithName("education_rank").WithDataType(entity.FieldTypeInt64)).
+		WithField(entity.NewField().WithName("experience_months").WithDataType(entity.FieldTypeInt64)).
 		WithField(textField).
 		WithField(entity.NewField().WithName(s.cfg.MilvusVectorField).WithDataType(entity.FieldTypeFloatVector).WithDim(int64(s.cfg.EmbeddingDimension))).
 		WithField(entity.NewField().WithName(s.cfg.MilvusSparseVectorField).WithDataType(entity.FieldTypeSparseVector)).
@@ -340,7 +416,7 @@ func newResumeRAGSearcher(ctx context.Context, cfg config.RAGConfig) (*resumeRAG
 	}
 	if len(cfg.MilvusOutputFields) == 0 {
 		cfg.MilvusOutputFields = []string{
-			"chunk_id", "hr_id", "job_id", "created_at",
+			"chunk_id", "hr_id", "job_id", "application_id", "resume_id", "candidate_id", "education_degree", "education_rank", "experience_months", "created_at",
 		}
 	}
 	embedder, err := newDashScopeOpenAIEmbedder(ctx, cfg)
@@ -391,9 +467,10 @@ func (s *resumeRAGSearcher) Search(ctx context.Context, hrID uint64, input Resum
 	return documentsToSemanticItems(docs), nil
 }
 
-func (s *resumeRAGSearcher) RecommendByJD(ctx context.Context, hrID uint64, input ResumeRecommendationInput) ([]ResumeSemanticSearchItem, error) {
-	queries := recommendationQueries(input)
-	if len(queries) == 0 {
+func (s *resumeRAGSearcher) RecommendByPlan(ctx context.Context, hrID uint64, input ResumeRecommendationInput, plan recommendationParsePlan, recallLimit int) ([]ResumeSemanticSearchItem, error) {
+	vectorQuery := normalizeResumeText(plan.VectorQuery)
+	keywordQuery := recommendationKeywordQuery(plan)
+	if vectorQuery == "" && keywordQuery == "" {
 		return nil, fmt.Errorf("recommendation query is required")
 	}
 	milvusClient, err := s.newMilvusClient(ctx)
@@ -402,16 +479,8 @@ func (s *resumeRAGSearcher) RecommendByJD(ctx context.Context, hrID uint64, inpu
 	}
 	defer milvusClient.Close(ctx)
 
-	candidateLimit := normalizeRecommendationLimit(input.Limit)
-	evidenceLimit := normalizeEvidenceLimit(input.EvidenceLimit)
-	perQueryLimit := candidateLimit * evidenceLimit * 4
-	if perQueryLimit < 30 {
-		perQueryLimit = 30
-	}
-	if perQueryLimit > 80 {
-		perQueryLimit = 80
-	}
-	filter := s.recommendationFilterExpr(hrID, input)
+	perQueryLimit := normalizeRecommendationRecallLimit(recallLimit)
+	filter := s.recommendationFilterExpr(hrID, input, plan.FilterConditions)
 	denseRetriever, err := s.newMilvusRetriever(ctx, milvusClient, perQueryLimit, einoSearchMode.NewApproximate(einoMilvus.MetricType(strings.ToUpper(s.cfg.MilvusMetricType))))
 	if err != nil {
 		return nil, err
@@ -425,10 +494,9 @@ func (s *resumeRAGSearcher) RecommendByJD(ctx context.Context, hrID uint64, inpu
 		allItems []ResumeSemanticSearchItem
 	)
 	eg, egCtx := errgroup.WithContext(ctx)
-	for _, query := range queries {
-		query := query
+	if vectorQuery != "" {
 		eg.Go(func() error {
-			docs, err := denseRetriever.Retrieve(egCtx, query, einoMilvus.WithFilter(filter))
+			docs, err := denseRetriever.Retrieve(egCtx, vectorQuery, einoMilvus.WithFilter(filter))
 			if err != nil {
 				return fmt.Errorf("dense recommendation search milvus: %w", err)
 			}
@@ -439,8 +507,10 @@ func (s *resumeRAGSearcher) RecommendByJD(ctx context.Context, hrID uint64, inpu
 			mu.Unlock()
 			return nil
 		})
+	}
+	if keywordQuery != "" {
 		eg.Go(func() error {
-			docs, err := sparseRetriever.Retrieve(egCtx, query, einoMilvus.WithFilter(filter))
+			docs, err := sparseRetriever.Retrieve(egCtx, keywordQuery, einoMilvus.WithFilter(filter))
 			if err != nil {
 				return fmt.Errorf("keyword recommendation search milvus: %w", err)
 			}
@@ -455,7 +525,14 @@ func (s *resumeRAGSearcher) RecommendByJD(ctx context.Context, hrID uint64, inpu
 	if err := eg.Wait(); err != nil {
 		return nil, err
 	}
-	return mergeRecommendationItems(allItems), nil
+	items := mergeRecommendationItems(allItems)
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].Score > items[j].Score
+	})
+	if len(items) > perQueryLimit {
+		items = items[:perQueryLimit]
+	}
+	return items, nil
 }
 
 func resultSetsToSemanticItems(results []milvus.ResultSet) ([]ResumeSemanticSearchItem, error) {
@@ -535,8 +612,22 @@ func recommendationEvidenceScore(semanticScore, keywordScore float32) float32 {
 }
 
 func recommendationQueries(input ResumeRecommendationInput) []string {
+	values := make([]string, 0, len(input.Queries)+1)
+	values = append(values, input.JobDescription)
+	values = append(values, input.Queries...)
+	return normalizeRecommendationQueries(values)
+}
+
+func recommendationKeywordQuery(plan recommendationParsePlan) string {
+	values := make([]string, 0, len(plan.MustKeywords)+len(plan.ShouldKeywords))
+	values = append(values, plan.MustKeywords...)
+	values = append(values, plan.ShouldKeywords...)
+	return strings.Join(normalizeRecommendationQueries(values), " ")
+}
+
+func normalizeRecommendationQueries(values []string) []string {
 	seen := map[string]struct{}{}
-	queries := make([]string, 0, len(input.Queries)+1)
+	queries := make([]string, 0, len(values))
 	add := func(value string) {
 		value = normalizeResumeText(value)
 		if value == "" {
@@ -551,8 +642,7 @@ func recommendationQueries(input ResumeRecommendationInput) []string {
 		seen[value] = struct{}{}
 		queries = append(queries, value)
 	}
-	add(input.JobDescription)
-	for _, query := range input.Queries {
+	for _, query := range values {
 		add(query)
 	}
 	if len(queries) > 5 {
@@ -561,12 +651,18 @@ func recommendationQueries(input ResumeRecommendationInput) []string {
 	return queries
 }
 
-func (s *resumeRAGSearcher) recommendationFilterExpr(hrID uint64, input ResumeRecommendationInput) string {
-	filters := []string{fmt.Sprintf("hr_id == %d", hrID)}
+func (s *resumeRAGSearcher) recommendationFilterExpr(hrID uint64, input ResumeRecommendationInput, conditions recommendationFilterConditions) string {
+	parts := []string{fmt.Sprintf("hr_id == %d", hrID)}
 	if input.JobID > 0 {
-		filters = append(filters, fmt.Sprintf("job_id == %d", input.JobID))
+		parts = append(parts, fmt.Sprintf("job_id == %d", input.JobID))
 	}
-	return strings.Join(filters, " && ")
+	if conditions.MinExperienceMonths > 0 {
+		parts = append(parts, fmt.Sprintf("experience_months >= %d", conditions.MinExperienceMonths))
+	}
+	if rank := educationRankFromDegree(conditions.EducationDegree); rank > 0 {
+		parts = append(parts, fmt.Sprintf("education_rank >= %d", rank))
+	}
+	return strings.Join(parts, " && ")
 }
 
 func aggregateRecommendationCandidates(items []ResumeSemanticSearchItem, limit, evidenceLimit int) []ResumeRecommendationCandidate {
@@ -636,10 +732,20 @@ func aggregateEvidenceSignal(evidence []ResumeSemanticSearchItem, evidenceLimit 
 
 func normalizeRecommendationLimit(limit int) int {
 	if limit <= 0 {
-		return 5
+		return recommendationRerankTopK
 	}
-	if limit > 10 {
-		return 10
+	if limit > recommendationRerankTopK {
+		return recommendationRerankTopK
+	}
+	return limit
+}
+
+func normalizeRecommendationRecallLimit(limit int) int {
+	if limit <= 0 {
+		return recommendationRecallTopK
+	}
+	if limit > 100 {
+		return 100
 	}
 	return limit
 }
@@ -669,9 +775,11 @@ func resultSetToSemanticItems(result milvus.ResultSet) ([]ResumeSemanticSearchIt
 			score = result.Scores[i]
 		}
 		items = append(items, ResumeSemanticSearchItem{
-			Score:   score,
-			ChunkID: uint64(row.ChunkID),
-			JobID:   uint64(row.JobID),
+			Score:       score,
+			ChunkID:     uint64(row.ChunkID),
+			ResumeID:    uint64(row.ResumeID),
+			JobID:       uint64(row.JobID),
+			CandidateID: uint64(row.CandidateID),
 		})
 	}
 	return items, nil
@@ -1095,6 +1203,74 @@ func float64VectorsToFloat32(vectors [][]float64) ([][]float32, error) {
 		out = append(out, converted)
 	}
 	return out, nil
+}
+
+var (
+	experienceYearPattern  = regexp.MustCompile(`(\d+(?:\.\d+)?)\s*(年|year|years)`)
+	experienceMonthPattern = regexp.MustCompile(`(\d+)\s*(个月|月|month|months)`)
+)
+
+func normalizeEducationDegree(value string) string {
+	value = strings.ToLower(normalizeResumeText(value))
+	switch {
+	case strings.Contains(value, "博士") || strings.Contains(value, "doctor") || strings.Contains(value, "phd"):
+		return "doctor"
+	case strings.Contains(value, "硕士") || strings.Contains(value, "研究生") || strings.Contains(value, "master"):
+		return "master"
+	case strings.Contains(value, "本科") || strings.Contains(value, "学士") || strings.Contains(value, "bachelor"):
+		return "bachelor"
+	case strings.Contains(value, "大专") || strings.Contains(value, "专科") || strings.Contains(value, "associate") || strings.Contains(value, "college"):
+		return "associate"
+	default:
+		return value
+	}
+}
+
+func educationRankFromDegree(value string) int {
+	switch normalizeEducationDegree(value) {
+	case "associate":
+		return 1
+	case "bachelor":
+		return 2
+	case "master":
+		return 3
+	case "doctor":
+		return 4
+	default:
+		return 0
+	}
+}
+
+func estimateProfileExperienceMonths(profile domain.CandidateProfile) int {
+	text := strings.Join([]string{profile.Experience, profile.WorkExperience, profile.ProjectExperience}, "\n")
+	text = strings.ToLower(normalizeResumeText(text))
+	maxMonths := 0
+	for _, match := range experienceYearPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		years, err := strconv.ParseFloat(match[1], 64)
+		if err != nil {
+			continue
+		}
+		months := int(years * 12)
+		if months > maxMonths {
+			maxMonths = months
+		}
+	}
+	for _, match := range experienceMonthPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		months, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+		if months > maxMonths {
+			maxMonths = months
+		}
+	}
+	return maxMonths
 }
 
 func minInt(a, b int) int {

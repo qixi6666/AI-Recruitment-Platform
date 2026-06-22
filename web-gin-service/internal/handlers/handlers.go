@@ -70,7 +70,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	hr.PATCH("/jobs/:id/offline", h.OfflineJob)
 	hr.GET("/applications", h.ListHRApplications)
 	hr.GET("/resumes/:id/download", h.DownloadResume)
-	hr.POST("/resume-recommendations", h.RecommendResumes)
+	hr.POST("/resume-recommendations", middleware.DuplicateSubmit(h.redis, 3*time.Second), h.RecommendResumes)
 	hr.POST("/resume-recommendations/stream", h.RecommendResumesStream)
 	hr.GET("/resume-recommendations/:task_id/stream", h.WatchResumeRecommendationTask)
 }

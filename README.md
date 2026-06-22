@@ -197,11 +197,12 @@ XCLAIM ...
 
 ```text
 task_id
-active_message_id
-active_attempt
+status
+owner_id
+lease_until
 ```
 
-如果旧 Worker 后续恢复，它会发现自己不是当前 active attempt，停止写入，避免重复输出。
+Redis 只维护 task 的基础幂等租约，用来证明某个 `task_id` 正在被哪个 Worker 执行。重复投递到达时，如果已有有效租约，后来的 Worker 会跳过并 ACK；旧 Worker 后续恢复时会发现自己不再持有 `owner_id`，停止写入，避免重复输出。重试和 RAG 兜底属于 Worker 内部执行策略，不写入 Redis 状态机。
 
 ## 大模型兜底
 
@@ -281,7 +282,7 @@ MILVUS_VECTOR_FIELD="dense_vector"
 MILVUS_SPARSE_VECTOR_FIELD="sparse_vector"
 MILVUS_TEXT_FIELD="search_text"
 MILVUS_METRIC_TYPE="COSINE"
-MILVUS_OUTPUT_FIELDS="chunk_id,hr_id,job_id,created_at"
+MILVUS_OUTPUT_FIELDS="chunk_id,hr_id,job_id,application_id,resume_id,candidate_id,education_degree,education_rank,experience_months,created_at"
 RAG_TOP_K=8
 ```
 
