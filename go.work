@@ -1,6 +1,7 @@
 go 1.25.8
 
 use (
+	./llm-gateway-service
 	./logic-grpc-service
 	./shared
 	./web-gin-service

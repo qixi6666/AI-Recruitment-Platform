@@ -25,25 +25,26 @@ import (
 )
 
 const (
-	recommendationTaskStatusQueued      = "queued"
-	recommendationTaskStatusRunning     = "running"
-	recommendationTaskStatusSucceeded   = "succeeded"
-	recommendationTaskStatusFailed      = "failed"
-	recommendationAgentStatusRAGOnly    = "rag_only"
-	recommendationEventStreamTTL        = 10 * time.Minute
-	recommendationResultCacheTTL        = 30 * time.Minute
-	recommendationResultCacheVersion    = "v1"
-	recommendationTaskLeaseTTL          = 60 * time.Second
-	recommendationTaskHeartbeatInterval = 10 * time.Second
-	recommendationTaskMaxAttempts       = 3
+	recommendationTaskStatusQueued          = "queued"
+	recommendationTaskStatusRunning         = "running"
+	recommendationTaskStatusSucceeded       = "succeeded"
+	recommendationTaskStatusFailed          = "failed"
+	recommendationAgentStatusRAGOnly        = "rag_only"
+	recommendationEventStreamTTL            = 10 * time.Minute
+	recommendationResultCacheTTL            = 10 * time.Minute
+	recommendationResultCacheVersion        = "v1"
+	recommendationTaskLeaseTTL              = 60 * time.Second
+	recommendationTaskHeartbeatInterval     = 10 * time.Second
+	recommendationTaskMaxAttempts           = 3
+	recommendationCheckpointFieldPlan       = "plan"
+	recommendationCheckpointFieldRAG        = "rag_items"
+	recommendationCheckpointFieldEvidence   = "evidence_items"
+	recommendationCheckpointFieldCandidates = "candidates"
 )
 
 type recommendationTaskPayload struct {
-	TaskID     string                       `json:"task_id"`
-	HRID       uint64                       `json:"hr_id"`
-	Input      ai.ResumeRecommendationInput `json:"input"`
-	RequestKey string                       `json:"request_key"`
-	CacheKey   string                       `json:"cache_key"`
+	HRID  uint64                       `json:"hr_id"`
+	Input ai.ResumeRecommendationInput `json:"input"`
 }
 
 type recommendationCacheInput struct {
@@ -61,6 +62,11 @@ type recommendationTaskLease struct {
 	acquired bool
 	terminal bool
 	status   string
+}
+
+type recommendationCheckpointStore struct {
+	q       *RecommendationQueue
+	ownerID string
 }
 
 type RecommendationQueue struct {
@@ -139,7 +145,10 @@ func (q *RecommendationQueue) Enqueue(ctx context.Context, hrID uint64, input ai
 		return nil, status.Error(codes.Internal, "build recommendation request fingerprint")
 	}
 	requestKey := q.requestKey(fingerprint)
-	cacheKey := q.resultCacheKey(fingerprint)
+	cacheKey := ""
+	if q.cacheRecommendationResult(input) {
+		cacheKey = q.resultCacheKey(fingerprint)
+	}
 	if existingTaskID, err := q.rdb.Get(ctx, requestKey).Result(); err == nil {
 		if resp, ok, err := q.existingTaskResponse(ctx, existingTaskID, cacheKey); err != nil {
 			return nil, err
@@ -156,12 +165,12 @@ func (q *RecommendationQueue) Enqueue(ctx context.Context, hrID uint64, input ai
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	now := time.Now()
-	payload := recommendationTaskPayload{TaskID: taskID, HRID: hrID, Input: input, RequestKey: requestKey, CacheKey: cacheKey}
+	payload := recommendationTaskPayload{HRID: hrID, Input: input}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	created, existingTaskID, err := q.createTaskIfAbsent(ctx, requestKey, q.taskKey(taskID), taskID, hrID, cacheKey, now, string(data))
+	created, existingTaskID, err := q.createTaskIfAbsent(ctx, requestKey, q.taskKey(taskID), taskID, hrID, now, string(data))
 	if err != nil {
 		return nil, err
 	}
@@ -346,15 +355,13 @@ func (q *RecommendationQueue) processMessage(consumer string, msg redis.XMessage
 		return fmt.Errorf("decode recommendation task message=%s task_id=%s: %w", msg.ID, taskID, err)
 	}
 	if taskID == "" {
-		taskID = payload.TaskID
+		return fmt.Errorf("recommendation task message=%s missing task_id", msg.ID)
 	}
-	if payload.CacheKey == "" {
-		fingerprint := q.requestFingerprint(payload.HRID, payload.Input)
-		payload.CacheKey = q.resultCacheKey(fingerprint)
-	}
-	if payload.RequestKey == "" {
-		fingerprint := q.requestFingerprint(payload.HRID, payload.Input)
-		payload.RequestKey = q.requestKey(fingerprint)
+	fingerprint := q.requestFingerprint(payload.HRID, payload.Input)
+	requestKey := q.requestKey(fingerprint)
+	cacheKey := ""
+	if q.cacheRecommendationResult(payload.Input) {
+		cacheKey = q.resultCacheKey(fingerprint)
 	}
 	ownerID := consumer + ":" + msg.ID
 	lease, err := q.claimTaskLease(context.Background(), taskID, ownerID)
@@ -381,8 +388,12 @@ func (q *RecommendationQueue) processMessage(consumer string, msg redis.XMessage
 	}
 	out, err := q.runRecommendationWithRetries(ctx, taskID, ownerID, payload)
 	if err != nil {
-		if fallbackErr := q.completeTaskWithRAGFallback(context.Background(), taskID, ownerID, payload, err); fallbackErr != nil {
-			q.failTask(context.Background(), taskID, ownerID, fmt.Sprintf("%v；RAG 兜底也失败：%v", err, fallbackErr))
+		if shouldCompleteRecommendationWithRAGOnly(err) {
+			if fallbackErr := q.completeTaskWithRAGFallback(context.Background(), taskID, ownerID, requestKey, payload, err); fallbackErr != nil {
+				q.failTask(context.Background(), taskID, ownerID, fmt.Sprintf("%v；RAG 兜底也失败：%v", err, fallbackErr))
+			}
+		} else {
+			q.failTask(context.Background(), taskID, ownerID, err.Error())
 		}
 		return nil
 	}
@@ -399,15 +410,15 @@ func (q *RecommendationQueue) processMessage(consumer string, msg redis.XMessage
 		return fmt.Errorf("stale recommendation task owner task_id=%s owner=%s", taskID, ownerID)
 	}
 	resp := resumeRecommendationResponse(out)
-	if out.AgentStatus != recommendationAgentStatusRAGOnly {
-		if err := q.storeCachedRecommendationResponse(context.Background(), payload.CacheKey, resp); err != nil {
-			log.Printf("store recommendation cache task_id=%s cache_key=%s: %v", taskID, payload.CacheKey, err)
-			_ = q.rdb.Del(context.Background(), payload.RequestKey).Err()
+	if cacheKey != "" && out.AgentStatus != recommendationAgentStatusRAGOnly {
+		if err := q.storeCachedRecommendationResponse(context.Background(), cacheKey, resp); err != nil {
+			log.Printf("store recommendation cache task_id=%s cache_key=%s: %v", taskID, cacheKey, err)
+			_ = q.rdb.Del(context.Background(), requestKey).Err()
 		} else {
-			_ = q.rdb.Expire(context.Background(), payload.RequestKey, recommendationResultCacheTTL).Err()
+			_ = q.rdb.Expire(context.Background(), requestKey, recommendationResultCacheTTL).Err()
 		}
 	} else {
-		_ = q.rdb.Del(context.Background(), payload.RequestKey).Err()
+		_ = q.rdb.Del(context.Background(), requestKey).Err()
 	}
 	if err := q.completeTask(context.Background(), taskID, ownerID, resp); err != nil {
 		return err
@@ -421,10 +432,90 @@ func (q *RecommendationQueue) failTask(ctx context.Context, taskID string, owner
 	}
 }
 
+func (s recommendationCheckpointStore) LoadRecommendationCheckpoint(ctx context.Context, taskID string) (ai.ResumeRecommendationCheckpoint, error) {
+	return s.q.loadRecommendationCheckpoint(ctx, taskID)
+}
+
+func (s recommendationCheckpointStore) SaveRecommendationPlan(ctx context.Context, taskID string, plan ai.ResumeRecommendationPlan) error {
+	return s.q.saveRecommendationCheckpointField(ctx, taskID, s.ownerID, recommendationCheckpointFieldPlan, plan)
+}
+
+func (s recommendationCheckpointStore) SaveRecommendationRAGItems(ctx context.Context, taskID string, items []ai.ResumeSemanticSearchItem) error {
+	return s.q.saveRecommendationCheckpointField(ctx, taskID, s.ownerID, recommendationCheckpointFieldRAG, items)
+}
+
+func (s recommendationCheckpointStore) SaveRecommendationEvidenceItems(ctx context.Context, taskID string, items []ai.ResumeSemanticSearchItem) error {
+	return s.q.saveRecommendationCheckpointField(ctx, taskID, s.ownerID, recommendationCheckpointFieldEvidence, items)
+}
+
+func (s recommendationCheckpointStore) SaveRecommendationCandidates(ctx context.Context, taskID string, candidates []ai.ResumeRecommendationCandidate) error {
+	return s.q.saveRecommendationCheckpointField(ctx, taskID, s.ownerID, recommendationCheckpointFieldCandidates, candidates)
+}
+
+func (q *RecommendationQueue) loadRecommendationCheckpoint(ctx context.Context, taskID string) (ai.ResumeRecommendationCheckpoint, error) {
+	values, err := q.rdb.HGetAll(ctx, q.checkpointKey(taskID)).Result()
+	if err != nil {
+		return ai.ResumeRecommendationCheckpoint{}, fmt.Errorf("load recommendation checkpoint task_id=%s: %w", taskID, err)
+	}
+	var checkpoint ai.ResumeRecommendationCheckpoint
+	if raw := values[recommendationCheckpointFieldPlan]; raw != "" {
+		var plan ai.ResumeRecommendationPlan
+		if err := json.Unmarshal([]byte(raw), &plan); err != nil {
+			return ai.ResumeRecommendationCheckpoint{}, fmt.Errorf("decode recommendation plan checkpoint task_id=%s: %w", taskID, err)
+		}
+		checkpoint.Plan = &plan
+	}
+	if raw := values[recommendationCheckpointFieldRAG]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &checkpoint.RAGItems); err != nil {
+			return ai.ResumeRecommendationCheckpoint{}, fmt.Errorf("decode recommendation rag checkpoint task_id=%s: %w", taskID, err)
+		}
+	}
+	if raw := values[recommendationCheckpointFieldEvidence]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &checkpoint.EvidenceItems); err != nil {
+			return ai.ResumeRecommendationCheckpoint{}, fmt.Errorf("decode recommendation evidence checkpoint task_id=%s: %w", taskID, err)
+		}
+	}
+	if raw := values[recommendationCheckpointFieldCandidates]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &checkpoint.Candidates); err != nil {
+			return ai.ResumeRecommendationCheckpoint{}, fmt.Errorf("decode recommendation candidates checkpoint task_id=%s: %w", taskID, err)
+		}
+	}
+	return checkpoint, nil
+}
+
+func (q *RecommendationQueue) saveRecommendationCheckpointField(ctx context.Context, taskID string, ownerID string, field string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	const script = `
+if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
+	return 0
+end
+redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
+redis.call("EXPIRE", KEYS[2], ARGV[4])
+return 1
+`
+	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.checkpointKey(taskID)},
+		ownerID,
+		field,
+		string(data),
+		strconv.Itoa(int(q.taskTTL.Seconds())),
+	).Int()
+	if err != nil {
+		return fmt.Errorf("save recommendation checkpoint task_id=%s field=%s: %w", taskID, field, err)
+	}
+	if ok != 1 {
+		return fmt.Errorf("task lease is no longer owned")
+	}
+	return nil
+}
+
 func (q *RecommendationQueue) runRecommendationWithRetries(ctx context.Context, taskID string, ownerID string, payload recommendationTaskPayload) (ai.ResumeRecommendationOutput, error) {
 	var lastErr error
+	checkpoints := recommendationCheckpointStore{q: q, ownerID: ownerID}
 	for attempt := 1; attempt <= recommendationTaskMaxAttempts; attempt++ {
-		out, err := q.ai.RecommendResumesByJDWithProgress(ctx, payload.HRID, payload.Input, func(stage string, message string) error {
+		out, err := q.ai.RecommendResumesByJDWithCheckpoint(ctx, taskID, payload.HRID, payload.Input, checkpoints, func(stage string, message string) error {
 			if stage != "final_answer_streaming" {
 				return nil
 			}
@@ -437,6 +528,9 @@ func (q *RecommendationQueue) runRecommendationWithRetries(ctx context.Context, 
 			return out, nil
 		}
 		lastErr = err
+		if !shouldRetryRecommendationBusinessError(err) {
+			break
+		}
 		if attempt >= recommendationTaskMaxAttempts {
 			break
 		}
@@ -448,7 +542,7 @@ func (q *RecommendationQueue) runRecommendationWithRetries(ctx context.Context, 
 	return ai.ResumeRecommendationOutput{}, lastErr
 }
 
-func (q *RecommendationQueue) completeTaskWithRAGFallback(ctx context.Context, taskID string, ownerID string, payload recommendationTaskPayload, cause error) error {
+func (q *RecommendationQueue) completeTaskWithRAGFallback(ctx context.Context, taskID string, ownerID string, requestKey string, payload recommendationTaskPayload, cause error) error {
 	active, err := q.taskOwnerActive(ctx, taskID, ownerID)
 	if err != nil {
 		return err
@@ -465,11 +559,104 @@ func (q *RecommendationQueue) completeTaskWithRAGFallback(ctx context.Context, t
 		return fmt.Errorf("clear partial recommendation stream task_id=%s: %w", taskID, err)
 	}
 	resp := resumeRecommendationResponse(out)
-	_ = q.rdb.Del(ctx, payload.RequestKey).Err()
+	_ = q.rdb.Del(ctx, requestKey).Err()
 	if err := q.completeTask(ctx, taskID, ownerID, resp); err != nil {
 		return err
 	}
 	return nil
+}
+
+func shouldRetryRecommendationBusinessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	nonRetryable := []string{
+		"task lease is no longer owned",
+		"permission denied",
+		"unauthenticated",
+		"invalid argument",
+		"job_description or queries is required",
+		"recommendation query is required",
+		"rag resume recommendation is disabled",
+		"not found",
+		"返回格式无效",
+		"empty vector_query",
+		"empty candidates",
+	}
+	for _, marker := range nonRetryable {
+		if strings.Contains(text, strings.ToLower(marker)) {
+			return false
+		}
+	}
+	retryable := []string{
+		"connection refused",
+		"connection reset",
+		"connection reset by peer",
+		"no such host",
+		"timeout",
+		"i/o timeout",
+		"temporary",
+		"temporarily unavailable",
+		"server closed idle connection",
+		"redis",
+		"milvus",
+		"mysql",
+		"deadlock",
+		"lock wait timeout",
+		"too many connections",
+		"unavailable",
+		"eof",
+	}
+	for _, marker := range retryable {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldCompleteRecommendationWithRAGOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	infrastructureFailures := []string{
+		"task lease is no longer owned",
+		"append recommendation final answer",
+		"redis",
+		"milvus",
+		"mysql",
+		"database",
+		"recommendation query is required",
+		"job_description or queries is required",
+		"rag resume recommendation is disabled",
+	}
+	for _, marker := range infrastructureFailures {
+		if strings.Contains(text, marker) {
+			return false
+		}
+	}
+	modelFailures := []string{
+		"llm gateway",
+		"推荐判断模型",
+		"model_call",
+		"stream llm",
+		"streamllm",
+		"chat llm",
+		"chatllm",
+		"returned no choices",
+		"返回格式无效",
+	}
+	for _, marker := range modelFailures {
+		if strings.Contains(text, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (q *RecommendationQueue) claimTaskLease(ctx context.Context, taskID string, ownerID string) (recommendationTaskLease, error) {
@@ -480,7 +667,7 @@ local status = redis.call("HGET", KEYS[1], "status")
 if not status then
 	return {"missing", "0"}
 end
-if status == ARGV[5] or status == ARGV[6] then
+if status == ARGV[4] or status == ARGV[5] then
 	return {status, "1"}
 end
 local lease_until = redis.call("HGET", KEYS[1], "lease_until")
@@ -488,20 +675,17 @@ if lease_until and lease_until ~= "" and tonumber(lease_until) > tonumber(ARGV[1
 	return {status, "0"}
 end
 redis.call("HSET", KEYS[1],
-	"status", ARGV[4],
+	"status", ARGV[3],
 	"owner_id", ARGV[2],
-	"lease_until", ARGV[7],
-	"heartbeat_at", ARGV[3],
-	"updated_at", ARGV[3])
+	"lease_until", ARGV[6])
 redis.call("HDEL", KEYS[1], "error")
-redis.call("EXPIRE", KEYS[1], ARGV[8])
+redis.call("EXPIRE", KEYS[1], ARGV[7])
 redis.call("DEL", KEYS[2])
-return {ARGV[4], "2"}
+return {ARGV[3], "2"}
 `
 	result, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.eventsStreamKey(taskID)},
 		strconv.FormatInt(now.UnixNano(), 10),
 		ownerID,
-		now.Format(time.RFC3339),
 		recommendationTaskStatusRunning,
 		recommendationTaskStatusSucceeded,
 		recommendationTaskStatusFailed,
@@ -543,26 +727,20 @@ func (q *RecommendationQueue) heartbeatTaskLease(ctx context.Context, taskID str
 }
 
 func (q *RecommendationQueue) refreshTaskLease(ctx context.Context, taskID string, ownerID string) error {
-	now := time.Now()
-	leaseUntil := now.Add(recommendationTaskLeaseTTL)
+	leaseUntil := time.Now().Add(recommendationTaskLeaseTTL)
 	const script = `
 if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
 	return 0
 end
-local status = redis.call("HGET", KEYS[1], "status")
-if status ~= ARGV[4] then
+if redis.call("HGET", KEYS[1], "status") ~= ARGV[3] then
 	return 0
 end
-redis.call("HSET", KEYS[1],
-	"lease_until", ARGV[2],
-	"heartbeat_at", ARGV[3],
-	"updated_at", ARGV[3])
+redis.call("HSET", KEYS[1], "lease_until", ARGV[2])
 return 1
 `
 	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID)},
 		ownerID,
 		strconv.FormatInt(leaseUntil.UnixNano(), 10),
-		now.Format(time.RFC3339),
 		recommendationTaskStatusRunning,
 	).Int()
 	if err != nil {
@@ -615,26 +793,23 @@ func (q *RecommendationQueue) failTaskIfOwner(ctx context.Context, taskID string
 	if err != nil {
 		return err
 	}
-	now := time.Now().Format(time.RFC3339)
 	const script = `
 if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
 	return 0
 end
 redis.call("HSET", KEYS[1],
 	"status", ARGV[2],
-	"error", ARGV[3],
-	"updated_at", ARGV[4])
-redis.call("HDEL", KEYS[1], "owner_id", "lease_until", "heartbeat_at")
-redis.call("EXPIRE", KEYS[1], ARGV[7])
-redis.call("XADD", KEYS[2], "*", "payload", ARGV[5])
-redis.call("EXPIRE", KEYS[2], ARGV[6])
+	"error", ARGV[3])
+redis.call("HDEL", KEYS[1], "owner_id", "lease_until")
+redis.call("EXPIRE", KEYS[1], ARGV[6])
+redis.call("XADD", KEYS[2], "*", "payload", ARGV[4])
+redis.call("EXPIRE", KEYS[2], ARGV[5])
 return 1
 `
 	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.eventsStreamKey(taskID)},
 		ownerID,
 		recommendationTaskStatusFailed,
 		reason,
-		now,
 		string(data),
 		strconv.Itoa(int(recommendationEventStreamTTL.Seconds())),
 		strconv.Itoa(int(q.taskTTL.Seconds())),
@@ -661,24 +836,20 @@ func (q *RecommendationQueue) completeTask(ctx context.Context, taskID string, o
 	if err != nil {
 		return err
 	}
-	now := time.Now().Format(time.RFC3339)
 	const script = `
 if redis.call("HGET", KEYS[1], "owner_id") ~= ARGV[1] then
 	return 0
 end
-redis.call("HSET", KEYS[1],
-	"status", ARGV[2],
-	"updated_at", ARGV[3])
-redis.call("HDEL", KEYS[1], "owner_id", "lease_until", "heartbeat_at", "error")
-redis.call("EXPIRE", KEYS[1], ARGV[4])
-redis.call("XADD", KEYS[2], "*", "payload", ARGV[5])
-redis.call("EXPIRE", KEYS[2], ARGV[6])
+redis.call("HSET", KEYS[1], "status", ARGV[2])
+redis.call("HDEL", KEYS[1], "owner_id", "lease_until", "error")
+redis.call("EXPIRE", KEYS[1], ARGV[3])
+redis.call("XADD", KEYS[2], "*", "payload", ARGV[4])
+redis.call("EXPIRE", KEYS[2], ARGV[5])
 return 1
 `
 	ok, err := q.rdb.Eval(ctx, script, []string{q.taskKey(taskID), q.eventsStreamKey(taskID)},
 		ownerID,
 		recommendationTaskStatusSucceeded,
-		now,
 		strconv.Itoa(int(q.taskTTL.Seconds())),
 		string(data),
 		strconv.Itoa(int(recommendationEventStreamTTL.Seconds())),
@@ -692,7 +863,7 @@ return 1
 	return nil
 }
 
-func (q *RecommendationQueue) createTaskIfAbsent(ctx context.Context, requestKey string, taskKey string, taskID string, hrID uint64, cacheKey string, now time.Time, payload string) (bool, string, error) {
+func (q *RecommendationQueue) createTaskIfAbsent(ctx context.Context, requestKey string, taskKey string, taskID string, hrID uint64, now time.Time, payload string) (bool, string, error) {
 	const script = `
 local existing = redis.call("GET", KEYS[1])
 if existing then
@@ -703,12 +874,9 @@ redis.call("HSET", KEYS[2],
 	"task_id", ARGV[1],
 	"hr_id", ARGV[3],
 	"status", ARGV[4],
-	"request_key", KEYS[1],
-	"cache_key", ARGV[5],
-	"created_at", ARGV[6],
-	"updated_at", ARGV[6])
-redis.call("EXPIRE", KEYS[2], ARGV[7])
-redis.call("XADD", KEYS[3], "*", "task_id", ARGV[1], "payload", ARGV[8])
+	"created_at", ARGV[5])
+redis.call("EXPIRE", KEYS[2], ARGV[6])
+redis.call("XADD", KEYS[3], "*", "task_id", ARGV[1], "payload", ARGV[7])
 return {1, ARGV[1]}
 `
 	result, err := q.rdb.Eval(ctx, script, []string{requestKey, taskKey, q.streamName},
@@ -716,7 +884,6 @@ return {1, ARGV[1]}
 		strconv.Itoa(int(recommendationResultCacheTTL.Seconds())),
 		strconv.FormatUint(hrID, 10),
 		recommendationTaskStatusQueued,
-		cacheKey,
 		now.Format(time.RFC3339),
 		strconv.Itoa(int(q.taskTTL.Seconds())),
 		payload,
@@ -889,6 +1056,10 @@ func (q *RecommendationQueue) eventsStreamKey(taskID string) string {
 	return q.taskKey(taskID) + ":events"
 }
 
+func (q *RecommendationQueue) checkpointKey(taskID string) string {
+	return q.taskKey(taskID) + ":checkpoint"
+}
+
 func (q *RecommendationQueue) requestKey(fingerprint string) string {
 	if fingerprint == "" {
 		return ""
@@ -901,6 +1072,10 @@ func (q *RecommendationQueue) resultCacheKey(fingerprint string) string {
 		return ""
 	}
 	return "resume_recommendation:cache:" + fingerprint
+}
+
+func (q *RecommendationQueue) cacheRecommendationResult(input ai.ResumeRecommendationInput) bool {
+	return len(normalizedRecommendationCacheQueries(input.Queries)) == 0
 }
 
 func (q *RecommendationQueue) requestFingerprint(hrID uint64, input ai.ResumeRecommendationInput) string {

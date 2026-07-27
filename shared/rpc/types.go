@@ -279,6 +279,76 @@ type ResumeRecommendationEvidence struct {
 	ResumeName      string  `json:"resume_name"`
 }
 
+type LLMMessageDTO struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type LLMModelDTO struct {
+	Name       string `json:"name"`
+	Provider   string `json:"provider"`
+	BaseURL    string `json:"base_url"`
+	Model      string `json:"model"`
+	Configured bool   `json:"configured"`
+}
+
+type LLMUsageDTO struct {
+	PromptTokens     int32 `json:"prompt_tokens,omitempty"`
+	CompletionTokens int32 `json:"completion_tokens,omitempty"`
+	TotalTokens      int32 `json:"total_tokens,omitempty"`
+}
+
+type ListLLMModelsRequest struct {
+	Actor *Actor `json:"actor"`
+}
+
+type ListLLMModelsResponse struct {
+	Models []*LLMModelDTO `json:"models"`
+}
+
+type LLMChatRequest struct {
+	Actor        *Actor           `json:"actor"`
+	Model        string           `json:"model"`
+	SystemPrompt string           `json:"system_prompt,omitempty"`
+	Prompt       string           `json:"prompt,omitempty"`
+	Messages     []*LLMMessageDTO `json:"messages,omitempty"`
+	Temperature  float32          `json:"temperature,omitempty"`
+	MaxTokens    int32            `json:"max_tokens,omitempty"`
+}
+
+type LLMChatResponse struct {
+	Model        string       `json:"model"`
+	Provider     string       `json:"provider"`
+	Content      string       `json:"content"`
+	FinishReason string       `json:"finish_reason,omitempty"`
+	LatencyMs    int64        `json:"latency_ms"`
+	Usage        *LLMUsageDTO `json:"usage,omitempty"`
+}
+
+type LLMEvaluateRequest struct {
+	Actor        *Actor           `json:"actor"`
+	Models       []string         `json:"models,omitempty"`
+	SystemPrompt string           `json:"system_prompt,omitempty"`
+	Prompt       string           `json:"prompt,omitempty"`
+	Messages     []*LLMMessageDTO `json:"messages,omitempty"`
+	Temperature  float32          `json:"temperature,omitempty"`
+	MaxTokens    int32            `json:"max_tokens,omitempty"`
+}
+
+type LLMEvaluationResultDTO struct {
+	Model        string       `json:"model"`
+	Provider     string       `json:"provider"`
+	Content      string       `json:"content,omitempty"`
+	FinishReason string       `json:"finish_reason,omitempty"`
+	LatencyMs    int64        `json:"latency_ms"`
+	Usage        *LLMUsageDTO `json:"usage,omitempty"`
+	Error        string       `json:"error,omitempty"`
+}
+
+type LLMEvaluateResponse struct {
+	Results []*LLMEvaluationResultDTO `json:"results"`
+}
+
 func FormatTime(t time.Time) string {
 	if t.IsZero() {
 		return ""

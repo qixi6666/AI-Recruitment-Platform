@@ -82,6 +82,7 @@ func main() {
 	rpc.RegisterCandidateServiceServer(grpcServer, logicServer)
 	rpc.RegisterApplicationServiceServer(grpcServer, logicServer)
 	rpc.RegisterResumeRecommendationServiceServer(grpcServer, logicServer)
+	rpc.RegisterLLMGatewayServiceServer(grpcServer, logicServer)
 	healthServer := healthgrpc.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)

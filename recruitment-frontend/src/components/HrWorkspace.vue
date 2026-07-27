@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { Archive, Edit3, Plus, RefreshCcw, Save, UsersRound } from 'lucide-vue-next'
 import { api, downloadResume, type JobPayload } from '../api/client'
+import LLMGatewayPanel from './LLMGatewayPanel.vue'
 import ResumeRecommendations from './ResumeRecommendations.vue'
 import type { ApplicationDTO, JobDTO } from '../types/api'
 
@@ -294,5 +295,7 @@ async function handleDownload(app: ApplicationDTO) {
     </div>
 
     <ResumeRecommendations class="span-wide" :jobs="jobs" />
+
+    <LLMGatewayPanel class="span-wide" />
   </section>
 </template>

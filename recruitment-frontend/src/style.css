@@ -624,10 +624,106 @@ label span {
 	white-space: pre-wrap;
 }
 
+.llm-panel {
+	display: grid;
+	gap: 16px;
+}
+
+.llm-form {
+	display: grid;
+	gap: 16px;
+}
+
+.llm-model-grid,
+.llm-result-grid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 12px;
+}
+
+.model-option {
+	display: grid;
+	grid-template-columns: 18px minmax(0, 1fr) auto;
+	gap: 10px;
+	align-items: center;
+	min-height: 62px;
+	margin: 0;
+	padding: 12px;
+	border: 1px solid #dfe5df;
+	border-radius: 8px;
+	background: #ffffff;
+}
+
+.model-option input {
+	width: 18px;
+	min-height: 18px;
+	margin: 0;
+	padding: 0;
+	box-shadow: none;
+}
+
+.model-option span {
+	display: block;
+	min-width: 0;
+	margin: 0;
+	color: #17202a;
+	font-size: 14px;
+	font-weight: 700;
+}
+
+.model-option strong,
+.model-option small {
+	display: block;
+	overflow-wrap: anywhere;
+}
+
+.model-option small {
+	margin-top: 4px;
+	color: #697672;
+	font-size: 12px;
+	font-weight: 600;
+}
+
+.model-option em {
+	font-style: normal;
+}
+
+.llm-actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 10px;
+}
+
+.llm-result-card {
+	display: grid;
+	gap: 10px;
+	padding: 16px;
+	border: 1px solid #dfe5df;
+	border-radius: 8px;
+	background: #ffffff;
+}
+
+.llm-output {
+	max-height: 260px;
+	margin: 0;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+	padding: 12px;
+	border: 1px solid #dfe5df;
+	border-radius: 8px;
+	background: #f9fbf8;
+	color: #243832;
+	font: inherit;
+	line-height: 1.6;
+}
+
 @media (max-width: 1180px) {
 	.job-grid,
 	.application-grid,
-	.recommendation-list {
+	.recommendation-list,
+	.llm-result-grid {
 		grid-template-columns: repeat(2, minmax(0, 1fr));
 	}
 
@@ -670,6 +766,8 @@ label span {
 	.job-grid,
 	.application-grid,
 	.recommendation-list,
+	.llm-model-grid,
+	.llm-result-grid,
 	.recommend-form,
 	.stat-strip {
 		grid-template-columns: 1fr;

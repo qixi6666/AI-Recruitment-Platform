@@ -66,7 +66,28 @@ type ResumeRecommendationCandidate struct {
 	Evidence      []ResumeSemanticSearchItem `json:"evidence"`
 }
 
+// ResumeRecommendationCheckpoint stores completed recommendation stages so another worker can resume the task.
+type ResumeRecommendationCheckpoint struct {
+	Plan          *ResumeRecommendationPlan       `json:"plan,omitempty"`
+	RAGItems      []ResumeSemanticSearchItem      `json:"rag_items,omitempty"`
+	EvidenceItems []ResumeSemanticSearchItem      `json:"evidence_items,omitempty"`
+	Candidates    []ResumeRecommendationCandidate `json:"candidates,omitempty"`
+}
+
+// RecommendationCheckpointStore persists recommendation intermediate results outside the AI package.
+type RecommendationCheckpointStore interface {
+	LoadRecommendationCheckpoint(ctx context.Context, taskID string) (ResumeRecommendationCheckpoint, error)
+	SaveRecommendationPlan(ctx context.Context, taskID string, plan ResumeRecommendationPlan) error
+	SaveRecommendationRAGItems(ctx context.Context, taskID string, items []ResumeSemanticSearchItem) error
+	SaveRecommendationEvidenceItems(ctx context.Context, taskID string, items []ResumeSemanticSearchItem) error
+	SaveRecommendationCandidates(ctx context.Context, taskID string, candidates []ResumeRecommendationCandidate) error
+}
+
 func (c *Client) recommendResumesByJD(ctx context.Context, hrID uint64, input ResumeRecommendationInput, progress RecommendationProgressFunc) (ResumeRecommendationOutput, error) {
+	return c.recommendResumesByJDWithCheckpoint(ctx, "", hrID, input, nil, progress)
+}
+
+func (c *Client) recommendResumesByJDWithCheckpoint(ctx context.Context, taskID string, hrID uint64, input ResumeRecommendationInput, checkpoints RecommendationCheckpointStore, progress RecommendationProgressFunc) (ResumeRecommendationOutput, error) {
 	if err := emitRecommendationProgress(progress, "preparing", "正在准备岗位和推荐条件"); err != nil {
 		return ResumeRecommendationOutput{}, err
 	}
@@ -84,33 +105,87 @@ func (c *Client) recommendResumesByJD(ctx context.Context, hrID uint64, input Re
 	if strings.TrimSpace(input.JobDescription) == "" && len(input.Queries) == 0 {
 		return ResumeRecommendationOutput{}, fmt.Errorf("job_description or queries is required")
 	}
-	if err := emitRecommendationProgress(progress, "rag_initializing", "正在初始化 RAG 检索器"); err != nil {
-		return ResumeRecommendationOutput{}, err
+
+	var checkpoint ResumeRecommendationCheckpoint
+	if checkpoints != nil && strings.TrimSpace(taskID) != "" {
+		loaded, err := checkpoints.LoadRecommendationCheckpoint(ctx, taskID)
+		if err != nil {
+			return ResumeRecommendationOutput{}, err
+		}
+		checkpoint = loaded
+		if checkpoint.Plan != nil || checkpoint.RAGItems != nil || checkpoint.EvidenceItems != nil || checkpoint.Candidates != nil {
+			if err := emitRecommendationProgress(progress, "checkpoint_resumed", "已恢复推荐任务中间结果"); err != nil {
+				return ResumeRecommendationOutput{}, err
+			}
+		}
 	}
-	searcher, err := newResumeRAGSearcher(ctx, c.cfg.RAG)
-	if err != nil {
-		return ResumeRecommendationOutput{}, err
+
+	var plan ResumeRecommendationPlan
+	if checkpoint.Plan != nil {
+		plan = *checkpoint.Plan
+	} else {
+		plan = c.parseRecommendationPlan(ctx, input, jobTitle, progress)
+		if strings.TrimSpace(plan.VectorQuery) == "" && recommendationKeywordQuery(plan) == "" {
+			return ResumeRecommendationOutput{}, fmt.Errorf("recommendation query is required")
+		}
+		if checkpoints != nil && strings.TrimSpace(taskID) != "" {
+			if err := checkpoints.SaveRecommendationPlan(ctx, taskID, plan); err != nil {
+				return ResumeRecommendationOutput{}, err
+			}
+		}
 	}
-	plan := c.parseRecommendationPlan(ctx, input, jobTitle, progress)
-	if strings.TrimSpace(plan.VectorQuery) == "" && recommendationKeywordQuery(plan) == "" {
-		return ResumeRecommendationOutput{}, fmt.Errorf("recommendation query is required")
+
+	candidates := checkpoint.Candidates
+	if candidates == nil {
+		items := checkpoint.EvidenceItems
+		if items == nil {
+			items = checkpoint.RAGItems
+			if items == nil {
+				if strings.TrimSpace(plan.VectorQuery) == "" && recommendationKeywordQuery(plan) == "" {
+					return ResumeRecommendationOutput{}, fmt.Errorf("recommendation query is required")
+				}
+				if err := emitRecommendationProgress(progress, "rag_initializing", "正在初始化 RAG 检索器"); err != nil {
+					return ResumeRecommendationOutput{}, err
+				}
+				searcher, err := newResumeRAGSearcher(ctx, c.cfg.RAG)
+				if err != nil {
+					return ResumeRecommendationOutput{}, err
+				}
+				if err := emitRecommendationProgress(progress, "rag_searching", "正在执行 Milvus hybrid RAG 检索"); err != nil {
+					return ResumeRecommendationOutput{}, err
+				}
+				items, err = searcher.RecommendByPlan(ctx, hrID, input, plan, recommendationRecallTopK)
+				if err != nil {
+					return ResumeRecommendationOutput{}, err
+				}
+				if checkpoints != nil && strings.TrimSpace(taskID) != "" {
+					if err := checkpoints.SaveRecommendationRAGItems(ctx, taskID, items); err != nil {
+						return ResumeRecommendationOutput{}, err
+					}
+				}
+			}
+			if err := emitRecommendationProgress(progress, "evidence_loading", "正在回表补全候选人和经历证据"); err != nil {
+				return ResumeRecommendationOutput{}, err
+			}
+			var err error
+			items, err = c.enrichResumeSemanticItems(ctx, hrID, 0, items)
+			if err != nil {
+				return ResumeRecommendationOutput{}, err
+			}
+			items = c.rerankRecommendationEvidence(ctx, input, jobTitle, plan, items, recommendationRerankTopK, progress)
+			if checkpoints != nil && strings.TrimSpace(taskID) != "" {
+				if err := checkpoints.SaveRecommendationEvidenceItems(ctx, taskID, items); err != nil {
+					return ResumeRecommendationOutput{}, err
+				}
+			}
+		}
+		candidates = aggregateRecommendationCandidates(items, normalizeRecommendationLimit(input.Limit), normalizeEvidenceLimit(input.EvidenceLimit))
+		if checkpoints != nil && strings.TrimSpace(taskID) != "" {
+			if err := checkpoints.SaveRecommendationCandidates(ctx, taskID, candidates); err != nil {
+				return ResumeRecommendationOutput{}, err
+			}
+		}
 	}
-	if err := emitRecommendationProgress(progress, "rag_searching", "正在执行 Milvus hybrid RAG 检索"); err != nil {
-		return ResumeRecommendationOutput{}, err
-	}
-	items, err := searcher.RecommendByPlan(ctx, hrID, input, plan, recommendationRecallTopK)
-	if err != nil {
-		return ResumeRecommendationOutput{}, err
-	}
-	if err := emitRecommendationProgress(progress, "evidence_loading", "正在回表补全候选人和经历证据"); err != nil {
-		return ResumeRecommendationOutput{}, err
-	}
-	items, err = c.enrichResumeSemanticItems(ctx, hrID, 0, items)
-	if err != nil {
-		return ResumeRecommendationOutput{}, err
-	}
-	items = c.rerankRecommendationEvidence(ctx, input, jobTitle, plan, items, recommendationRerankTopK, progress)
-	candidates := aggregateRecommendationCandidates(items, normalizeRecommendationLimit(input.Limit), normalizeEvidenceLimit(input.EvidenceLimit))
 	if err := emitRecommendationProgress(progress, "agent_judging", "正在由推荐 agent 基于证据判断候选人"); err != nil {
 		return ResumeRecommendationOutput{}, err
 	}

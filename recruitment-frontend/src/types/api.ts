@@ -125,6 +125,34 @@ export interface ResumeRecommendationStreamChunk {
   response?: ResumeRecommendationResponse
 }
 
+export interface LLMModelDTO {
+  name: string
+  provider: string
+  base_url: string
+  model: string
+  configured: boolean
+}
+
+export interface LLMUsageDTO {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+}
+
+export interface LLMEvaluationResultDTO {
+  model: string
+  provider: string
+  content?: string
+  finish_reason?: string
+  latency_ms: number
+  usage?: LLMUsageDTO
+  error?: string
+}
+
+export interface LLMEvaluateResponse {
+  results: LLMEvaluationResultDTO[]
+}
+
 export interface ApiEnvelope<T> {
   data: T
 }

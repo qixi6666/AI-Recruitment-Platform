@@ -12,6 +12,7 @@ const (
 	candidateServiceName            = "recruitment.CandidateService"
 	applicationServiceName          = "recruitment.ApplicationService"
 	resumeRecommendationServiceName = "recruitment.ResumeRecommendationService"
+	llmGatewayServiceName           = "recruitment.LLMGatewayService"
 )
 
 type AuthServiceClient interface {
@@ -149,6 +150,38 @@ type ResumeRecommendationServiceClient interface {
 	WatchResumeRecommendationTask(ctx context.Context, in *ResumeRecommendationTaskWatchRequest, opts ...grpc.CallOption) (ResumeRecommendationService_WatchResumeRecommendationTaskClient, error)
 }
 
+type LLMGatewayServiceClient interface {
+	ListModels(ctx context.Context, in *ListLLMModelsRequest, opts ...grpc.CallOption) (*ListLLMModelsResponse, error)
+	Chat(ctx context.Context, in *LLMChatRequest, opts ...grpc.CallOption) (*LLMChatResponse, error)
+	Evaluate(ctx context.Context, in *LLMEvaluateRequest, opts ...grpc.CallOption) (*LLMEvaluateResponse, error)
+}
+
+type llmGatewayServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewLLMGatewayServiceClient(cc grpc.ClientConnInterface) LLMGatewayServiceClient {
+	return &llmGatewayServiceClient{cc: cc}
+}
+
+func (c *llmGatewayServiceClient) ListModels(ctx context.Context, in *ListLLMModelsRequest, opts ...grpc.CallOption) (*ListLLMModelsResponse, error) {
+	out := new(ListLLMModelsResponse)
+	err := c.cc.Invoke(ctx, "/recruitment.LLMGatewayService/ListModels", in, out, opts...)
+	return out, err
+}
+
+func (c *llmGatewayServiceClient) Chat(ctx context.Context, in *LLMChatRequest, opts ...grpc.CallOption) (*LLMChatResponse, error) {
+	out := new(LLMChatResponse)
+	err := c.cc.Invoke(ctx, "/recruitment.LLMGatewayService/Chat", in, out, opts...)
+	return out, err
+}
+
+func (c *llmGatewayServiceClient) Evaluate(ctx context.Context, in *LLMEvaluateRequest, opts ...grpc.CallOption) (*LLMEvaluateResponse, error) {
+	out := new(LLMEvaluateResponse)
+	err := c.cc.Invoke(ctx, "/recruitment.LLMGatewayService/Evaluate", in, out, opts...)
+	return out, err
+}
+
 type resumeRecommendationServiceClient struct {
 	cc grpc.ClientConnInterface
 }
@@ -264,6 +297,12 @@ type ResumeRecommendationServiceServer interface {
 	WatchResumeRecommendationTask(*ResumeRecommendationTaskWatchRequest, ResumeRecommendationService_WatchResumeRecommendationTaskServer) error
 }
 
+type LLMGatewayServiceServer interface {
+	ListModels(context.Context, *ListLLMModelsRequest) (*ListLLMModelsResponse, error)
+	Chat(context.Context, *LLMChatRequest) (*LLMChatResponse, error)
+	Evaluate(context.Context, *LLMEvaluateRequest) (*LLMEvaluateResponse, error)
+}
+
 func RegisterAuthServiceServer(s grpc.ServiceRegistrar, srv AuthServiceServer) {
 	s.RegisterService(&AuthService_ServiceDesc, srv)
 }
@@ -282,6 +321,10 @@ func RegisterApplicationServiceServer(s grpc.ServiceRegistrar, srv ApplicationSe
 
 func RegisterResumeRecommendationServiceServer(s grpc.ServiceRegistrar, srv ResumeRecommendationServiceServer) {
 	s.RegisterService(&ResumeRecommendationService_ServiceDesc, srv)
+}
+
+func RegisterLLMGatewayServiceServer(s grpc.ServiceRegistrar, srv LLMGatewayServiceServer) {
+	s.RegisterService(&LLMGatewayService_ServiceDesc, srv)
 }
 
 func unaryHandler[S any, Req any, Resp any](srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor, serviceName string, method string, fn func(S, context.Context, *Req) (*Resp, error)) (any, error) {
@@ -432,6 +475,23 @@ var ResumeRecommendationService_ServiceDesc = grpc.ServiceDesc{
 			Handler:       resumeRecommendationServiceWatchResumeRecommendationTaskHandler,
 			ServerStreams: true,
 		},
+	},
+	Metadata: "recruitment.proto",
+}
+
+var LLMGatewayService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: llmGatewayServiceName,
+	HandlerType: (*LLMGatewayServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{MethodName: "ListModels", Handler: func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+			return unaryHandler[LLMGatewayServiceServer, ListLLMModelsRequest, ListLLMModelsResponse](srv, ctx, dec, interceptor, llmGatewayServiceName, "ListModels", LLMGatewayServiceServer.ListModels)
+		}},
+		{MethodName: "Chat", Handler: func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+			return unaryHandler[LLMGatewayServiceServer, LLMChatRequest, LLMChatResponse](srv, ctx, dec, interceptor, llmGatewayServiceName, "Chat", LLMGatewayServiceServer.Chat)
+		}},
+		{MethodName: "Evaluate", Handler: func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+			return unaryHandler[LLMGatewayServiceServer, LLMEvaluateRequest, LLMEvaluateResponse](srv, ctx, dec, interceptor, llmGatewayServiceName, "Evaluate", LLMGatewayServiceServer.Evaluate)
+		}},
 	},
 	Metadata: "recruitment.proto",
 }

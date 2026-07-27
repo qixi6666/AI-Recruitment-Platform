@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"strconv"
@@ -47,7 +48,27 @@ type AIConfig struct {
 	BaseURL        string
 	Model          string
 	TimeoutSeconds int64
+	Gateway        LLMGatewayConfig
 	RAG            RAGConfig
+}
+
+type LLMGatewayConfig struct {
+	Address                   string
+	Token                     string
+	Models                    []LLMModelConfig
+	SimpleJDQueryModel        string
+	HRSearchPlanModel         string
+	RecommendationResultModel string
+}
+
+type LLMModelConfig struct {
+	Name           string `json:"name"`
+	Provider       string `json:"provider"`
+	APIKey         string `json:"api_key"`
+	APIKeyEnv      string `json:"api_key_env"`
+	BaseURL        string `json:"base_url"`
+	Model          string `json:"model"`
+	TimeoutSeconds int64  `json:"timeout_seconds"`
 }
 
 type RAGConfig struct {
@@ -138,6 +159,28 @@ func Load() (Config, error) {
 	overrideString(&cfg.AI.BaseURL, "DEEPSEEK_BASE_URL")
 	overrideString(&cfg.AI.Model, "DEEPSEEK_MODEL")
 	overrideInt64(&cfg.AI.TimeoutSeconds, "DEEPSEEK_TIMEOUT_SECONDS")
+	overrideString(&cfg.AI.Provider, "AI_PROVIDER")
+	if value := os.Getenv("LLM_GATEWAY_MODELS"); value != "" {
+		models, err := parseLLMModelConfigs(value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.AI.Gateway.Models = models
+	} else {
+		cfg.AI.Gateway.Models = []LLMModelConfig{{
+			Name:           defaultLLMModelName(cfg.AI.Provider, cfg.AI.Model),
+			Provider:       cfg.AI.Provider,
+			APIKey:         cfg.AI.APIKey,
+			BaseURL:        cfg.AI.BaseURL,
+			Model:          cfg.AI.Model,
+			TimeoutSeconds: cfg.AI.TimeoutSeconds,
+		}}
+	}
+	overrideString(&cfg.AI.Gateway.SimpleJDQueryModel, "LLM_SIMPLE_JD_QUERY_MODEL")
+	overrideString(&cfg.AI.Gateway.HRSearchPlanModel, "LLM_HR_SEARCH_PLAN_MODEL")
+	overrideString(&cfg.AI.Gateway.RecommendationResultModel, "LLM_RECOMMENDATION_RESULT_MODEL")
+	overrideString(&cfg.AI.Gateway.Address, "LLM_GATEWAY_ADDR")
+	overrideString(&cfg.AI.Gateway.Token, "LLM_GATEWAY_TOKEN")
 	overrideBool(&cfg.AI.RAG.Enabled, "RAG_ENABLED")
 	overrideString(&cfg.AI.RAG.EmbeddingAPIKey, "DASHSCOPE_API_KEY")
 	overrideString(&cfg.AI.RAG.EmbeddingAPIKey, "RAG_EMBEDDING_API_KEY")
@@ -160,6 +203,48 @@ func Load() (Config, error) {
 		return Config{}, errors.New("mysql dsn is required")
 	}
 	return cfg, nil
+}
+
+func parseLLMModelConfigs(value string) ([]LLMModelConfig, error) {
+	var models []LLMModelConfig
+	if err := json.Unmarshal([]byte(value), &models); err != nil {
+		return nil, err
+	}
+	for i := range models {
+		models[i].Name = strings.TrimSpace(models[i].Name)
+		models[i].Provider = strings.TrimSpace(models[i].Provider)
+		models[i].BaseURL = strings.TrimSpace(models[i].BaseURL)
+		models[i].Model = strings.TrimSpace(models[i].Model)
+		models[i].APIKeyEnv = strings.TrimSpace(models[i].APIKeyEnv)
+		if models[i].APIKey == "" && models[i].APIKeyEnv != "" {
+			models[i].APIKey = os.Getenv(models[i].APIKeyEnv)
+		}
+		if models[i].Provider == "" {
+			models[i].Provider = models[i].Name
+		}
+		if models[i].Name == "" {
+			models[i].Name = defaultLLMModelName(models[i].Provider, models[i].Model)
+		}
+		if models[i].TimeoutSeconds <= 0 {
+			models[i].TimeoutSeconds = 45
+		}
+	}
+	return models, nil
+}
+
+func defaultLLMModelName(provider, model string) string {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider != "" && model != "" {
+		return provider + "/" + model
+	}
+	if model != "" {
+		return model
+	}
+	if provider != "" {
+		return provider
+	}
+	return "default"
 }
 
 func loadDotEnv() error {

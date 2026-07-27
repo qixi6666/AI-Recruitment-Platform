@@ -5,13 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
-	"time"
-
-	"github.com/cloudwego/eino-ext/components/model/openai"
-	"github.com/cloudwego/eino/schema"
 )
 
 const (
@@ -30,55 +25,51 @@ type recommendationAgentResponse struct {
 	Candidates []recommendationAgentCandidate `json:"candidates"`
 }
 
-type recommendationParsePlan struct {
-	VectorQuery      string                         `json:"vector_query"`
-	MustKeywords     []string                       `json:"must_keywords"`
-	ShouldKeywords   []string                       `json:"should_keywords"`
-	FilterConditions recommendationFilterConditions `json:"filter_conditions"`
+// ResumeRecommendationPlan is the structured RAG retrieval plan generated for a recommendation task.
+type ResumeRecommendationPlan struct {
+	VectorQuery      string                               `json:"vector_query"`
+	MustKeywords     []string                             `json:"must_keywords"`
+	ShouldKeywords   []string                             `json:"should_keywords"`
+	FilterConditions ResumeRecommendationFilterConditions `json:"filter_conditions"`
 }
 
-type recommendationFilterConditions struct {
+// ResumeRecommendationFilterConditions contains metadata filters that can be applied before semantic search.
+type ResumeRecommendationFilterConditions struct {
 	MinExperienceMonths int    `json:"min_experience_months"`
 	EducationDegree     string `json:"education_degree"`
 }
 
-type recommendationRerankItem struct {
-	ChunkID uint64  `json:"chunk_id"`
-	Score   float32 `json:"score"`
-}
-
-type recommendationRerankResponse struct {
-	Items []recommendationRerankItem `json:"items"`
-}
+type recommendationParsePlan = ResumeRecommendationPlan
+type recommendationFilterConditions = ResumeRecommendationFilterConditions
 
 func (c *Client) parseRecommendationPlan(ctx context.Context, input ResumeRecommendationInput, jobTitle string, progress RecommendationProgressFunc) recommendationParsePlan {
 	fallback := fallbackRecommendationParsePlan(input)
-	if strings.TrimSpace(c.cfg.APIKey) == "" {
-		return fallback
-	}
+	task := recommendationPlanTask(input)
 	if progress != nil {
-		if err := progress("jd_parse_start", "正在由大模型结构化提炼 JD 检索计划"); err != nil {
+		message := "正在由 LLM Gateway 生成 JD 检索 query"
+		if task == LLMTaskHRSearchPlan {
+			message = "正在由 LLM Gateway 解析 HR 额外要求并生成检索计划"
+		}
+		if err := progress("jd_parse_start", message); err != nil {
 			return fallback
 		}
 	}
-	cm, ctx, cancel, err := c.newRecommendationChatModel(ctx)
+	output, err := c.ChatLLM(ctx, LLMChatInput{
+		Task:         task,
+		SystemPrompt: recommendationParseInstruction(task),
+		Prompt:       recommendationParsePrompt(input, jobTitle),
+		Temperature:  0,
+		MaxTokens:    700,
+	})
 	if err != nil {
 		return fallback
 	}
-	defer cancel()
-	msg, err := cm.Generate(ctx, []*schema.Message{
-		schema.SystemMessage(recommendationParseInstruction()),
-		schema.UserMessage(recommendationParsePrompt(input, jobTitle)),
-	})
-	if err != nil || msg == nil {
-		return fallback
-	}
-	plan, err := parseRecommendationPlanResponse(msg.Content)
+	plan, err := parseRecommendationPlanResponse(output.Content)
 	if err != nil || strings.TrimSpace(plan.VectorQuery) == "" {
 		return fallback
 	}
 	if progress != nil {
-		_ = progress("jd_parse_done", "已生成结构化 RAG 检索计划")
+		_ = progress("jd_parse_done", "已生成 RAG 检索计划")
 	}
 	return plan
 }
@@ -86,98 +77,43 @@ func (c *Client) parseRecommendationPlan(ctx context.Context, input ResumeRecomm
 func (c *Client) rerankRecommendationEvidence(ctx context.Context, input ResumeRecommendationInput, jobTitle string, plan recommendationParsePlan, items []ResumeSemanticSearchItem, limit int, progress RecommendationProgressFunc) []ResumeSemanticSearchItem {
 	limit = normalizeRecommendationRerankLimit(limit)
 	fallback := topRecommendationEvidence(items, limit)
-	if len(fallback) == 0 || strings.TrimSpace(c.cfg.APIKey) == "" {
-		return fallback
-	}
 	if progress != nil {
-		if err := progress("rerank_start", "正在由大模型 rerank 召回证据"); err != nil {
-			return fallback
-		}
+		_ = progress("rerank_done", fmt.Sprintf("已按 RAG hybrid score 选出 top%d 条候选证据", len(fallback)))
 	}
-	cm, ctx, cancel, err := c.newRecommendationChatModel(ctx)
-	if err != nil {
-		return fallback
-	}
-	defer cancel()
-	msg, err := cm.Generate(ctx, []*schema.Message{
-		schema.SystemMessage(recommendationRerankInstruction()),
-		schema.UserMessage(recommendationRerankPrompt(input, jobTitle, plan, items, recommendationRecallTopK, limit)),
-	})
-	if err != nil || msg == nil {
-		return fallback
-	}
-	reranked, err := parseRecommendationRerankResponse(msg.Content)
-	if err != nil || len(reranked.Items) == 0 {
-		return fallback
-	}
-	out := applyRecommendationEvidenceRerank(items, reranked, limit)
-	if len(out) == 0 {
-		return fallback
-	}
-	if progress != nil {
-		_ = progress("rerank_done", fmt.Sprintf("已 rerank 出 top%d 条候选证据", len(out)))
-	}
-	return out
+	return fallback
 }
 
 func (c *Client) judgeRecommendationCandidates(ctx context.Context, input ResumeRecommendationInput, jobTitle string, candidates []ResumeRecommendationCandidate, progress RecommendationProgressFunc) ([]ResumeRecommendationCandidate, string, string) {
 	if len(candidates) == 0 {
 		return candidates, recommendationAgentStatusRAGOnly, "RAG 未召回候选人"
 	}
-	if strings.TrimSpace(c.cfg.APIKey) == "" {
-		return fallbackRecommendationCandidates(candidates), recommendationAgentStatusRAGOnly, "未配置推荐判断模型，已返回 RAG 排序结果"
-	}
-
-	timeout := time.Duration(c.cfg.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cm, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  c.cfg.APIKey,
-		Model:   c.cfg.Model,
-		BaseURL: c.cfg.BaseURL,
-		Timeout: timeout,
-	})
-	if err != nil {
-		return fallbackRecommendationCandidates(candidates), recommendationAgentStatusRAGOnly, fmt.Sprintf("推荐判断模型初始化失败：%v", err)
-	}
-
 	if progress != nil {
-		if err := progress("model_call_start", "推荐判断模型开始调用"); err != nil {
+		if err := progress("model_call_start", "LLM Gateway 开始流式生成推荐判断结果"); err != nil {
 			return fallbackRecommendationCandidates(candidates), recommendationAgentStatusRAGOnly, fmt.Sprintf("推荐判断模型开始前状态校验失败：%v", err)
 		}
 	}
 
-	stream, err := cm.Stream(ctx, []*schema.Message{
-		schema.SystemMessage(recommendationAgentInstruction()),
-		schema.UserMessage(recommendationAgentPrompt(input, jobTitle, candidates)),
-	})
-	if err != nil {
-		return fallbackRecommendationCandidates(candidates), recommendationAgentStatusRAGOnly, recommendationAgentFallbackReason("推荐判断模型调用失败", err)
-	}
-	defer stream.Close()
-
 	var content strings.Builder
-	for {
-		msg, err := stream.Recv()
-		if err == io.EOF {
-			break
+	_, err := c.StreamLLM(ctx, LLMChatInput{
+		Task:         LLMTaskRecommendationResult,
+		SystemPrompt: recommendationAgentInstruction(),
+		Prompt:       recommendationAgentPrompt(input, jobTitle, candidates),
+		Temperature:  0,
+		MaxTokens:    1200,
+	}, func(chunk LLMStreamChunk) error {
+		if chunk.Content == "" {
+			return nil
 		}
-		if err != nil {
-			return fallbackRecommendationCandidates(candidates), recommendationAgentStatusRAGOnly, recommendationAgentFallbackReason("推荐判断模型流式调用失败", err)
-		}
-		if msg == nil || msg.Content == "" {
-			continue
-		}
-		content.WriteString(msg.Content)
+		content.WriteString(chunk.Content)
 		if progress != nil {
-			if err := progress("final_answer_streaming", msg.Content); err != nil {
-				return fallbackRecommendationCandidates(candidates), recommendationAgentStatusRAGOnly, fmt.Sprintf("推荐判断模型流式输出失败：%v", err)
+			if err := progress("final_answer_streaming", chunk.Content); err != nil {
+				return fmt.Errorf("推荐判断模型流式输出失败：%w", err)
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return fallbackRecommendationCandidates(candidates), recommendationAgentStatusRAGOnly, recommendationAgentFallbackReason("推荐判断模型流式调用失败", err)
 	}
 
 	judged, err := parseRecommendationAgentResponse(content.String())
@@ -185,25 +121,6 @@ func (c *Client) judgeRecommendationCandidates(ctx context.Context, input Resume
 		return fallbackRecommendationCandidates(candidates), recommendationAgentStatusRAGOnly, fmt.Sprintf("推荐判断模型返回格式无效：%v", err)
 	}
 	return applyRecommendationAgentJudgement(candidates, judged), recommendationAgentStatusJudged, ""
-}
-
-func (c *Client) newRecommendationChatModel(ctx context.Context) (*openai.ChatModel, context.Context, context.CancelFunc, error) {
-	timeout := time.Duration(c.cfg.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	childCtx, cancel := context.WithTimeout(ctx, timeout)
-	cm, err := openai.NewChatModel(childCtx, &openai.ChatModelConfig{
-		APIKey:  c.cfg.APIKey,
-		Model:   c.cfg.Model,
-		BaseURL: c.cfg.BaseURL,
-		Timeout: timeout,
-	})
-	if err != nil {
-		cancel()
-		return nil, nil, nil, err
-	}
-	return cm, childCtx, cancel, nil
 }
 
 func recommendationAgentFallbackReason(prefix string, err error) string {
@@ -217,10 +134,30 @@ func recommendationAgentFallbackReason(prefix string, err error) string {
 	return fmt.Sprintf("%s：%v，已返回 RAG 检索候选人兜底结果", prefix, err)
 }
 
-func recommendationParseInstruction() string {
+func recommendationPlanTask(input ResumeRecommendationInput) string {
+	if len(normalizeRecommendationQueries(input.Queries)) == 0 {
+		return LLMTaskSimpleJDQuery
+	}
+	return LLMTaskHRSearchPlan
+}
+
+func recommendationParseInstruction(task string) string {
+	if task == LLMTaskSimpleJDQuery {
+		return strings.Join([]string{
+			"你是招聘 RAG 系统的 JD query 生成器，需要把岗位 JD 转成检索计划 JSON。",
+			"vector_query 用自然语言描述候选人应具备的核心经历场景，不要堆砌关键词。",
+			"must_keywords 放硬技能核心词；should_keywords 放加分技能、框架、项目或工具词。",
+			"filter_conditions 只能放能从简历元数据硬过滤的基础条件；无法明确判断时用 0 或空字符串。",
+			"只输出 JSON，不要输出 Markdown，不要添加解释性文字。",
+			"JSON schema: {\"vector_query\":\"负责高并发后端服务开发，熟悉微服务架构设计和 MySQL/Redis 等基础设施。\",\"must_keywords\":[\"Go\",\"Golang\"],\"should_keywords\":[\"Gin\",\"Redis\",\"Docker\"],\"filter_conditions\":{\"min_experience_months\":36,\"education_degree\":\"bachelor\"}}",
+			"education_degree 只能是 associate、bachelor、master、doctor 或空字符串。",
+		}, "\n")
+	}
 	return strings.Join([]string{
-		"你是招聘 RAG 系统的 JD 结构化解析器，需要把岗位 JD 提炼成检索计划 JSON。",
+		"你是招聘 RAG 系统的 HR 检索计划生成器，需要综合岗位 JD 和 HR 额外要求输出检索计划 JSON。",
 		"必须综合 job_description 和 hr_requirements；hr_requirements 是 HR 本次推荐的额外偏好、限制或加分项。",
+		"把可以由现有简历元数据判断的要求放入 filter_conditions，例如工作年限、学历层级；不要编造不存在的过滤字段。",
+		"不能硬过滤的要求，例如高并发经验、微服务经验、沟通能力、稳定性、业务理解，必须进入 vector_query、must_keywords 或 should_keywords。",
 		"vector_query 用自然语言描述候选人应具备的核心经历场景，不要堆砌关键词。",
 		"must_keywords 放硬技能核心词；should_keywords 放加分技能、框架、项目或工具词。",
 		"filter_conditions 只放可硬过滤的基础条件；无法明确判断时用 0 或空字符串。",
@@ -245,69 +182,6 @@ func recommendationParsePrompt(input ResumeRecommendationInput, jobTitle string)
 		return "{}"
 	}
 	return "请根据以下岗位信息生成结构化 RAG 检索计划 JSON：\n" + string(data)
-}
-
-func recommendationRerankInstruction() string {
-	return strings.Join([]string{
-		"你是招聘 RAG 系统的证据 reranker，只能根据 JD 和候选人经历证据判断相关性。",
-		"目标是从召回证据中选出最能支持候选人匹配岗位的 top20 证据。",
-		"不要编造证据，不要输出未出现在输入中的 chunk_id。",
-		"只输出 JSON，不要输出 Markdown，不要添加解释性文字。",
-		"JSON schema: {\"items\":[{\"chunk_id\":123,\"score\":0.95}]}",
-		"score 必须在 0 到 1 之间，items 最多 20 条，按相关性从高到低排序。",
-	}, "\n")
-}
-
-func recommendationRerankPrompt(input ResumeRecommendationInput, jobTitle string, plan recommendationParsePlan, items []ResumeSemanticSearchItem, recallLimit, rerankLimit int) string {
-	type rerankEvidence struct {
-		ChunkID       uint64  `json:"chunk_id"`
-		CandidateID   uint64  `json:"candidate_id"`
-		CandidateName string  `json:"candidate_name,omitempty"`
-		Section       string  `json:"section,omitempty"`
-		RAGScore      float32 `json:"rag_score"`
-		SemanticScore float32 `json:"semantic_score"`
-		KeywordScore  float32 `json:"keyword_score"`
-		Content       string  `json:"content"`
-	}
-	payload := struct {
-		JobTitle       string           `json:"job_title,omitempty"`
-		JobDescription string           `json:"job_description"`
-		VectorQuery    string           `json:"vector_query"`
-		MustKeywords   []string         `json:"must_keywords,omitempty"`
-		ShouldKeywords []string         `json:"should_keywords,omitempty"`
-		Limit          int              `json:"limit"`
-		Evidence       []rerankEvidence `json:"evidence"`
-	}{
-		JobTitle:       jobTitle,
-		JobDescription: truncateRunes(input.JobDescription, 1200),
-		VectorQuery:    truncateRunes(plan.VectorQuery, 500),
-		MustKeywords:   plan.MustKeywords,
-		ShouldKeywords: plan.ShouldKeywords,
-		Limit:          normalizeRecommendationRerankLimit(rerankLimit),
-		Evidence:       make([]rerankEvidence, 0, minInt(len(items), recallLimit)),
-	}
-	items = topRecommendationEvidence(items, recallLimit)
-	for _, item := range items {
-		section := strings.TrimSpace(item.SectionTitle)
-		if section == "" {
-			section = item.SectionType
-		}
-		payload.Evidence = append(payload.Evidence, rerankEvidence{
-			ChunkID:       item.ChunkID,
-			CandidateID:   item.CandidateID,
-			CandidateName: item.CandidateName,
-			Section:       section,
-			RAGScore:      item.Score,
-			SemanticScore: item.SemanticScore,
-			KeywordScore:  item.KeywordScore,
-			Content:       truncateRunes(item.Content, 420),
-		})
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return "{}"
-	}
-	return "请对以下召回证据进行 rerank，并返回 top evidence JSON：\n" + string(data)
 }
 
 func recommendationAgentInstruction() string {
@@ -399,18 +273,6 @@ func parseRecommendationPlanResponse(content string) (recommendationParsePlan, e
 	return out, nil
 }
 
-func parseRecommendationRerankResponse(content string) (recommendationRerankResponse, error) {
-	content = cleanRecommendationJSONContent(content)
-	var out recommendationRerankResponse
-	if err := json.Unmarshal([]byte(content), &out); err != nil {
-		return recommendationRerankResponse{}, err
-	}
-	if len(out.Items) == 0 {
-		return recommendationRerankResponse{}, fmt.Errorf("empty rerank items")
-	}
-	return out, nil
-}
-
 func cleanRecommendationJSONContent(content string) string {
 	content = strings.TrimSpace(content)
 	content = strings.TrimPrefix(content, "```json")
@@ -472,34 +334,6 @@ func topRecommendationEvidence(items []ResumeSemanticSearchItem, limit int) []Re
 	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
-	}
-	return out
-}
-
-func applyRecommendationEvidenceRerank(items []ResumeSemanticSearchItem, reranked recommendationRerankResponse, limit int) []ResumeSemanticSearchItem {
-	byChunkID := make(map[uint64]ResumeSemanticSearchItem, len(items))
-	for _, item := range items {
-		if item.ChunkID == 0 {
-			continue
-		}
-		byChunkID[item.ChunkID] = item
-	}
-	out := make([]ResumeSemanticSearchItem, 0, minInt(limit, len(reranked.Items)))
-	seen := map[uint64]struct{}{}
-	for _, ranked := range reranked.Items {
-		if _, ok := seen[ranked.ChunkID]; ok {
-			continue
-		}
-		item, ok := byChunkID[ranked.ChunkID]
-		if !ok {
-			continue
-		}
-		item.Score = clampFloat32(ranked.Score, 0, 1)
-		out = append(out, item)
-		seen[ranked.ChunkID] = struct{}{}
-		if len(out) >= limit {
-			break
-		}
 	}
 	return out
 }

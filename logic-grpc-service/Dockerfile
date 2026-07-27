@@ -12,6 +12,7 @@ COPY go.work go.work.sum ./
 COPY shared/go.mod shared/go.sum ./shared/
 COPY logic-grpc-service/go.mod logic-grpc-service/go.sum ./logic-grpc-service/
 COPY web-gin-service/go.mod web-gin-service/go.sum ./web-gin-service/
+COPY llm-gateway-service/go.mod llm-gateway-service/go.sum* ./llm-gateway-service/
 
 WORKDIR /src/logic-grpc-service
 RUN for attempt in 1 2 3; do \

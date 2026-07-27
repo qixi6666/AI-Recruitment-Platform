@@ -16,6 +16,7 @@ type LogicClients struct {
 	Candidates      rpc.CandidateServiceClient
 	Applications    rpc.ApplicationServiceClient
 	Recommendations rpc.ResumeRecommendationServiceClient
+	LLM             rpc.LLMGatewayServiceClient
 }
 
 func DialLogic(addr string) (*grpc.ClientConn, LogicClients, error) {
@@ -34,6 +35,7 @@ func DialLogic(addr string) (*grpc.ClientConn, LogicClients, error) {
 		Candidates:      rpc.NewCandidateServiceClient(conn),
 		Applications:    rpc.NewApplicationServiceClient(conn),
 		Recommendations: rpc.NewResumeRecommendationServiceClient(conn),
+		LLM:             rpc.NewLLMGatewayServiceClient(conn),
 	}, nil
 }
 
@@ -44,6 +46,9 @@ func timeoutUnaryInterceptor(ctx context.Context, method string, req any, reply 
 	timeout := 8 * time.Second
 	if method == "/recruitment.ResumeRecommendationService/RecommendResumes" {
 		timeout = 60 * time.Second
+	}
+	if method == "/recruitment.LLMGatewayService/Chat" || method == "/recruitment.LLMGatewayService/Evaluate" {
+		timeout = 120 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

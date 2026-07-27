@@ -3,6 +3,8 @@ import type {
   ApplicationDTO,
   CandidateProfileDTO,
   JobDTO,
+  LLMEvaluateResponse,
+  LLMModelDTO,
   ListResponse,
   ResumeRecommendationStreamChunk,
   ResumeRecommendationTaskResponse,
@@ -141,6 +143,21 @@ export const api = {
     evidence_limit?: number
   }) {
     return request<ResumeRecommendationTaskResponse>('/hr/resume-recommendations', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  listLLMModels() {
+    return request<{ models: LLMModelDTO[] }>('/hr/llm/models')
+  },
+  evaluateLLM(payload: {
+    models?: string[]
+    system_prompt?: string
+    prompt?: string
+    temperature?: number
+    max_tokens?: number
+  }) {
+    return request<LLMEvaluateResponse>('/hr/llm/evaluate', {
       method: 'POST',
       body: JSON.stringify(payload),
     })

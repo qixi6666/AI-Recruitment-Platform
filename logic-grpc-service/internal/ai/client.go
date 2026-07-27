@@ -31,6 +31,14 @@ func (c *Client) RecommendResumesByJDWithProgress(ctx context.Context, hrID uint
 	return c.recommendResumesByJD(ctx, hrID, input, progress)
 }
 
+// RecommendResumesByJDWithCheckpoint runs an async recommendation task and stores stage outputs for worker recovery.
+func (c *Client) RecommendResumesByJDWithCheckpoint(ctx context.Context, taskID string, hrID uint64, input ResumeRecommendationInput, checkpoints RecommendationCheckpointStore, progress RecommendationProgressFunc) (ResumeRecommendationOutput, error) {
+	if !c.ragEnabled() {
+		return ResumeRecommendationOutput{}, fmt.Errorf("rag resume recommendation is disabled")
+	}
+	return c.recommendResumesByJDWithCheckpoint(ctx, taskID, hrID, input, checkpoints, progress)
+}
+
 func (c *Client) RecommendResumesRAGOnly(ctx context.Context, hrID uint64, input ResumeRecommendationInput, fallbackReason string) (ResumeRecommendationOutput, error) {
 	if !c.ragEnabled() {
 		return ResumeRecommendationOutput{}, fmt.Errorf("rag resume recommendation is disabled")

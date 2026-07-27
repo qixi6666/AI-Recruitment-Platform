@@ -26,6 +26,7 @@ type Handler struct {
 	candidates      rpc.CandidateServiceClient
 	applications    rpc.ApplicationServiceClient
 	recommendations rpc.ResumeRecommendationServiceClient
+	llm             rpc.LLMGatewayServiceClient
 	redis           *redis.Client
 	jwtSecret       string
 	jwtExpireHours  int64
@@ -39,6 +40,7 @@ func New(logic client.LogicClients, redisClient *redis.Client, jwtSecret string,
 		candidates:      logic.Candidates,
 		applications:    logic.Applications,
 		recommendations: logic.Recommendations,
+		llm:             logic.LLM,
 		redis:           redisClient,
 		jwtSecret:       jwtSecret,
 		jwtExpireHours:  jwtExpireHours,
@@ -73,6 +75,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	hr.POST("/resume-recommendations", middleware.DuplicateSubmit(h.redis, 3*time.Second), h.RecommendResumes)
 	hr.POST("/resume-recommendations/stream", h.RecommendResumesStream)
 	hr.GET("/resume-recommendations/:task_id/stream", h.WatchResumeRecommendationTask)
+	hr.GET("/llm/models", h.ListLLMModels)
+	hr.POST("/llm/chat", h.ChatLLM)
+	hr.POST("/llm/evaluate", h.EvaluateLLM)
 }
 
 func (h *Handler) Register(c *gin.Context) {
@@ -334,6 +339,46 @@ func (h *Handler) RecommendResumesStream(c *gin.Context) {
 func (h *Handler) WatchResumeRecommendationTask(c *gin.Context) {
 	actor, _ := middleware.Actor(c)
 	h.writeRecommendationTaskSSE(c, actor, c.Param("task_id"))
+}
+
+func (h *Handler) ListLLMModels(c *gin.Context) {
+	actor, _ := middleware.Actor(c)
+	resp, err := h.llm.ListModels(c.Request.Context(), &rpc.ListLLMModelsRequest{Actor: actor})
+	if err != nil {
+		httputil.Error(c, err)
+		return
+	}
+	httputil.OK(c, resp)
+}
+
+func (h *Handler) ChatLLM(c *gin.Context) {
+	actor, _ := middleware.Actor(c)
+	var req rpc.LLMChatRequest
+	if !bind(c, &req) {
+		return
+	}
+	req.Actor = actor
+	resp, err := h.llm.Chat(c.Request.Context(), &req)
+	if err != nil {
+		httputil.Error(c, err)
+		return
+	}
+	httputil.OK(c, resp)
+}
+
+func (h *Handler) EvaluateLLM(c *gin.Context) {
+	actor, _ := middleware.Actor(c)
+	var req rpc.LLMEvaluateRequest
+	if !bind(c, &req) {
+		return
+	}
+	req.Actor = actor
+	resp, err := h.llm.Evaluate(c.Request.Context(), &req)
+	if err != nil {
+		httputil.Error(c, err)
+		return
+	}
+	httputil.OK(c, resp)
 }
 
 func (h *Handler) writeRecommendationTaskSSE(c *gin.Context, actor *rpc.Actor, taskID string) {
